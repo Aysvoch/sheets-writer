@@ -252,6 +252,23 @@ def low_salary_flag(salary_min):
         return ''
 
 # ==========================================================================
+# Retry с экспоненциальной задержкой (для нестабильных внешних сервисов)
+# ==========================================================================
+def with_retry(fn, tries=5, base_delay=2, what="операция"):
+    """До 5 попыток с паузами 2/4/8/16с. После последней - падаем с понятной ошибкой."""
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == tries:
+                print(f"  [retry] {what}: не удалось после {tries} попыток: {e}")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"  [retry] {what}: попытка {attempt} не удалась ({e}), "
+                  f"жду {delay}с и повторяю...")
+            time.sleep(delay)
+
+# ==========================================================================
 # Google Sheets
 # ==========================================================================
 def gc_client():
@@ -267,14 +284,16 @@ def gc_client():
 
 def read_raw(gc):
     """Читает обе вкладки сырья, возвращает список (source_id, текст_для_LLM, дата, ссылка)."""
-    ss = gc.open_by_key(RAW_SPREADSHEET_ID)
+    ss = with_retry(lambda: gc.open_by_key(RAW_SPREADSHEET_ID),
+                    what="открытие таблицы-сборщика")
     items = []
     for name in RAW_SHEETS:
         try:
             ws = ss.worksheet(name)
         except gspread.WorksheetNotFound:
             continue
-        rows = ws.get_all_records()   # list of dict по заголовкам
+        rows = with_retry(lambda ws=ws, name=name: ws.get_all_records(),
+                          what=f"чтение листа «{name}»")   # list of dict по заголовкам
         for row in rows:
             sid = str(row.get('source_id', '')).strip()
             if not sid:
@@ -296,19 +315,20 @@ def read_raw(gc):
 
 def open_out(gc):
     """Открывает/создаёт лист 'Вакансии' в Таблице неудач. Трекер и пр. НЕ трогаем."""
-    ss = gc.open_by_key(TRACKER_SPREADSHEET_ID)
+    ss = with_retry(lambda: gc.open_by_key(TRACKER_SPREADSHEET_ID),
+                    what="открытие Таблицы неудач")
     try:
         ws = ss.worksheet(OUT_SHEET)
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=OUT_SHEET, rows=2000, cols=len(COLUMNS))
-    vals = ws.get_all_values()
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа «Вакансии»")
     if not vals or vals[0][:len(COLUMNS)] != COLUMNS:
-        ws.update([COLUMNS], 'A1')
-        ws.freeze(rows=1)
+        with_retry(lambda: ws.update([COLUMNS], 'A1'), what="запись заголовка")
+        with_retry(lambda: ws.freeze(rows=1), what="закрепление шапки")
     return ws
 
 def existing_ids(ws):
-    vals = ws.get_all_values()
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение существующих ID")
     return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
 
 def build_row(num, item, data):
@@ -343,8 +363,10 @@ def color_for(company, low_flag):
 
 def fill_row(ws, rownum, rgb):
     last = chr(ord('A') + len(COLUMNS) - 1)
-    ws.format(f'A{rownum}:{last}{rownum}',
-              {'backgroundColor': {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}})
+    with_retry(lambda: ws.format(
+        f'A{rownum}:{last}{rownum}',
+        {'backgroundColor': {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}}
+    ), what="подсветка строки")
 
 def style_sheet(ws, n_rows):
     """Оформление под Дашборд: тёмная шапка, границы, ширины, закрепление, автофильтр."""
@@ -430,7 +452,8 @@ def main():
     print(f'  всего в сырье: {len(items)}, уже оценено: {len(have)}, '
           f'старше {MAX_AGE_DAYS}д пропущено: {skipped_old}, к оценке: {len(todo)}')
 
-    start_row = len(ws.get_all_values()) + 1   # с какой строки дописываем
+    start_row = len(with_retry(lambda: ws.get_all_values(),
+                               what="чтение листа перед записью")) + 1   # с какой строки дописываем
     num = len(have)
     added = 0
     skipped_junk = 0
@@ -448,7 +471,8 @@ def main():
             continue
         num += 1
         row = build_row(num, it, data)
-        ws.append_row(row, value_input_option='USER_ENTERED')
+        with_retry(lambda row=row: ws.append_row(row, value_input_option='USER_ENTERED'),
+                  what="запись строки в лист")
         rgb = color_for(data.get('company'), row[9])
         if rgb:
             fill_row(ws, start_row + added, rgb)
@@ -458,7 +482,7 @@ def main():
     print(f'  отсеяно (не вакансия/без ответа): {skipped_junk}')
 
     notify_count(added)
-    total_rows = len(ws.get_all_values())
+    total_rows = len(with_retry(lambda: ws.get_all_values(), what="чтение листа перед оформлением"))
     style_sheet(ws, total_rows)
     print(f'\nЗвено 2 готово. Оценено и записано: {added}. Прогон: {dt.date.today().isoformat()}')
     print(f'Модель: {LLM_MODEL}')
