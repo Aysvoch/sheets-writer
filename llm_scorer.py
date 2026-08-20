@@ -380,6 +380,15 @@ def fill_row(ws, rownum, rgb):
         {'backgroundColor': {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}}
     ), what="подсветка строки")
 
+def col_to_letter(idx):
+    """0-based индекс колонки -> буква(ы) Google Sheets (0->A, 25->Z, 26->AA, 27->AB...)."""
+    letters = ''
+    idx += 1
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(ord('A') + rem) + letters
+    return letters
+
 def style_sheet(ws, n_rows):
     """Оформление под Дашборд: тёмная шапка, границы, ширины, закрепление, автофильтр."""
     last = chr(ord('A') + len(COLUMNS) - 1)
@@ -432,7 +441,7 @@ def style_sheet(ws, n_rows):
     # подсветка просмотренных: условное форматирование, реагирует на клик по чекбоксу
     # (не разовая покраска при записи). Сначала убираем старые правила подсветки этого
     # листа (иначе они копятся с каждым прогоном), потом ставим одно свежее.
-    seen_col = chr(ord('A') + seen_idx)
+    seen_col = col_to_letter(seen_idx)
     cf_range = {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': max(n_rows, 1) + 1,
                 'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)}
     try:
