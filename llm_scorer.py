@@ -255,9 +255,15 @@ def low_salary_flag(salary_min):
 # Google Sheets
 # ==========================================================================
 def gc_client():
-    creds = Credentials.from_service_account_file(
-        CREDENTIALS_FILE, scopes=['https://www.googleapis.com/auth/spreadsheets'])
-    return gspread.authorize(creds)
+    try:
+        creds = Credentials.from_service_account_file(
+            CREDENTIALS_FILE, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        return gspread.authorize(creds)
+    except Exception as e:
+        raise SystemExit(
+            f"Ошибка подключения к Google Sheets: {e}. "
+            f"Проверь credentials.json и доступ к таблице."
+        )
 
 def read_raw(gc):
     """Читает обе вкладки сырья, возвращает список (source_id, текст_для_LLM, дата, ссылка)."""

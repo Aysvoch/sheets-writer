@@ -24,7 +24,6 @@ import re
 import time
 import datetime as dt
 from dataclasses import dataclass, field
-from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
