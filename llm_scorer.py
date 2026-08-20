@@ -374,7 +374,7 @@ def color_for(company):
     return None
 
 def fill_row(ws, rownum, rgb):
-    last = chr(ord('A') + len(COLUMNS) - 1)
+    last = col_to_letter(len(COLUMNS) - 1)
     with_retry(lambda: ws.format(
         f'A{rownum}:{last}{rownum}',
         {'backgroundColor': {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}}
@@ -391,7 +391,7 @@ def col_to_letter(idx):
 
 def style_sheet(ws, n_rows):
     """Оформление под Дашборд: тёмная шапка, границы, ширины, закрепление, автофильтр."""
-    last = chr(ord('A') + len(COLUMNS) - 1)
+    last = col_to_letter(len(COLUMNS) - 1)
     # тёмная шапка с белым жирным текстом (как заголовки Дашборда)
     ws.format(f'A1:{last}1', {
         'backgroundColor': {'red': 0.17, 'green': 0.24, 'blue': 0.31},
