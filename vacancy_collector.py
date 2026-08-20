@@ -63,6 +63,10 @@ TG_CHANNELS = [
     'juno_jobs', 'juniors_rabota_jobs', 'proglib_jobs', 'young_intern',
     'enter_career', 'IUCareerFinder', 'forproducts', 'product_jobs',
     'hireproproduct', 'jobs_for_products', 'hh_vacancy_product_project',
+    'jobstobefoundJobs', 'productconsult', 'jobforjunior', 'remotejun', 'grinternru',
+    'workvc', 'NUKUDA7', 'hsecareer', 'huggabletalents', 'ya_jobs_pm',
+    'digital_hr', 'geekjobs', 'mnogovakansiy', 'jobtalker', 'cozy_hr',
+    'promopoisk', 'xCareers', 'evacuatejobs', 'mtsfintechjobs', 'alfadigital_jobs',
 ]
 # Убраны как нечитаемые через t.me/s/ (это чаты/группы, не каналы-вещатели):
 #   rabotaICL, products_jobs — смотреть вручную.
