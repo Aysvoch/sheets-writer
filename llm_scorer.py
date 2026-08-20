@@ -169,8 +169,12 @@ SYSTEM_PROMPT = f"""Ты - строгий ассистент по подбору
 # ==========================================================================
 # LLM через OpenRouter
 # ==========================================================================
+LLM_TRIES = 3                  # макс. попыток вызова OpenRouter, потом честно сдаёмся
+LLM_RETRY_DELAYS = [2, 4]       # паузы между попытками (сек)
+
 def llm_evaluate(vacancy_text):
-    """Возвращает dict полей или None при ошибке."""
+    """Возвращает (dict полей, None) при успехе или (None, причина) при неудаче
+    после LLM_TRIES попыток. Ретраит сетевые ошибки/таймауты и 429/5xx."""
     body = {
         'model': LLM_MODEL,
         'messages': [
@@ -185,27 +189,42 @@ def llm_evaluate(vacancy_text):
         'Content-Type': 'application/json',
         'X-Title': 'vacancy-llm',
     }
-    try:
-        r = requests.post('https://openrouter.ai/api/v1/chat/completions',
-                          json=body, headers=headers, timeout=60)
-        if r.status_code == 429:                 # rate limit бесплатного тира
-            print('    [429] лимит запросов - жду 20с и повторяю...')
-            time.sleep(20)
+    reason = 'LLM ошибка'
+    for attempt in range(1, LLM_TRIES + 1):
+        try:
             r = requests.post('https://openrouter.ai/api/v1/chat/completions',
                               json=body, headers=headers, timeout=60)
-        time.sleep(SLEEP_LLM)
-        r.raise_for_status()
-        j = r.json()
-        choices = j.get('choices') or []
-        if not choices:
-            print(f'    [LLM пусто] нет choices в ответе')
-            return None
-        msg = choices[0].get('message', {}) or {}
-        content = msg.get('content') or msg.get('reasoning') or ''
-        return parse_llm_json(content)
-    except Exception as e:
-        print(f'    [LLM ошибка] {e}')
-        return None
+        except requests.exceptions.Timeout:
+            reason = 'LLM таймаут/сеть'
+        except requests.exceptions.RequestException:
+            reason = 'LLM таймаут/сеть'
+        else:
+            if r.status_code != 200:
+                reason = f'LLM HTTP {r.status_code}'
+            else:
+                try:
+                    j = r.json()
+                except ValueError:
+                    reason = 'LLM битый JSON'
+                else:
+                    choices = j.get('choices') or []
+                    msg = choices[0].get('message', {}) or {} if choices else {}
+                    content = msg.get('content') or msg.get('reasoning') or ''
+                    if not content:
+                        reason = 'LLM пустой ответ'
+                    else:
+                        data = parse_llm_json(content)
+                        if data is None:
+                            reason = 'LLM битый JSON'
+                        else:
+                            time.sleep(SLEEP_LLM)
+                            return data, None
+        if attempt < LLM_TRIES:
+            delay = LLM_RETRY_DELAYS[attempt - 1]
+            print(f'    [LLM] попытка {attempt}/{LLM_TRIES} не удалась ({reason}), '
+                  f'жду {delay}с и повторяю...')
+            time.sleep(delay)
+    return None, reason
 
 def parse_llm_json(content):
     """Достаёт JSON даже если модель обернула его в markdown/текст. None-safe."""
@@ -381,6 +400,7 @@ def style_sheet(ws, n_rows):
     # source_id, Компания, Должность, Опыт, Грейд, Источник, Формат, ЗП вилка,
     # Локация, Оценка, Вердикт, Опубликовано, Ссылка, Комментарий, Просмотрено
     widths = [80, 130, 240, 90, 70, 110, 90, 130, 150, 60, 320, 100, 60, 200, 90]
+    widths[COLUMNS.index('Формат')] = 100   # "Удалёнка"/"Гибрид" не должны обрезаться
     reqs = []
     sid = ws.id
     for i, w in enumerate(widths):
@@ -403,12 +423,40 @@ def style_sheet(ws, n_rows):
             'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP',
                                            'verticalAlignment': 'TOP'}},
             'fields': 'userEnteredFormat(wrapStrategy,verticalAlignment)'}})
-    # чекбоксы в колонке "Просмотрено" (данные + запас до конца текущего диапазона)
+    # чекбоксы РОВНО в колонке "Просмотрено" - ни шире, ни на соседнюю колонку
     seen_idx = COLUMNS.index('Просмотрено')
     reqs.append({'setDataValidation': {
         'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': max(n_rows, 1) + 1,
                   'startColumnIndex': seen_idx, 'endColumnIndex': seen_idx + 1},
         'rule': {'condition': {'type': 'BOOLEAN'}, 'strict': True}}})
+    # подсветка просмотренных: условное форматирование, реагирует на клик по чекбоксу
+    # (не разовая покраска при записи). Сначала убираем старые правила подсветки этого
+    # листа (иначе они копятся с каждым прогоном), потом ставим одно свежее.
+    seen_col = chr(ord('A') + seen_idx)
+    cf_range = {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': max(n_rows, 1) + 1,
+                'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)}
+    try:
+        meta = ws.spreadsheet.fetch_sheet_metadata(
+            params={'fields': 'sheets(properties(sheetId),conditionalFormats)'})
+        for sheet in meta.get('sheets', []):
+            if sheet.get('properties', {}).get('sheetId') == sid:
+                n_cf = len(sheet.get('conditionalFormats', []))
+                for i in range(n_cf - 1, -1, -1):
+                    reqs.append({'deleteConditionalFormatRule': {'sheetId': sid, 'index': i}})
+                break
+    except Exception as e:
+        print(f'  [оформление] не удалось прочитать старые правила подсветки: {e}')
+    reqs.append({'addConditionalFormatRule': {
+        'rule': {
+            'ranges': [cf_range],
+            'booleanRule': {
+                'condition': {'type': 'CUSTOM_FORMULA',
+                              'values': [{'userEnteredValue': f'=${seen_col}2=TRUE'}]},
+                'format': {'backgroundColor': {'red': 0.85, 'green': 0.94, 'blue': 0.85}},
+            },
+        },
+        'index': 0,
+    }})
     # сортировка: непросмотренные (чекбокс снят) сверху, внутри - по Оценке убыв.
     # Сортируем весь диапазон строк целиком -> Комментарий и подсветка едут со строкой.
     if n_rows > 1:
@@ -515,11 +563,11 @@ def main():
     added = 0
     skipped_junk = 0
     for it in todo:
-        data = llm_evaluate(it['text'])
+        data, fail_reason = llm_evaluate(it['text'])
         if not data:
-            # LLM не ответил (пусто/ошибка) - НЕ пишем, попадёт на повтор в след. прогон
+            # LLM не ответил после всех попыток - НЕ пишем, попадёт на повтор в след. прогон
             skipped_junk += 1
-            print(f'    пропуск (LLM не ответил): {it["source_id"]}')
+            print(f'    пропуск ({fail_reason}): {it["source_id"]}')
             continue
         # не одиночная вакансия (дайджест/инфопост/реклама) - не засоряем лист
         is_vac = str(data.get('is_vacancy', 'true')).strip().lower()

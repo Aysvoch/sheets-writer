@@ -63,13 +63,14 @@ TG_CHANNELS = [
     'juno_jobs', 'juniors_rabota_jobs', 'proglib_jobs', 'young_intern',
     'enter_career', 'IUCareerFinder', 'forproducts', 'product_jobs',
     'hireproproduct', 'jobs_for_products', 'hh_vacancy_product_project',
-    'jobstobefoundJobs', 'productconsult', 'jobforjunior', 'remotejun', 'grinternru',
+    'productconsult', 'jobforjunior', 'remotejun', 'grinternru',
     'workvc', 'NUKUDA7', 'hsecareer', 'huggabletalents', 'ya_jobs_pm',
     'digital_hr', 'geekjobs', 'mnogovakansiy', 'jobtalker', 'cozy_hr',
-    'promopoisk', 'xCareers', 'evacuatejobs', 'mtsfintechjobs', 'alfadigital_jobs',
+    'promopoisk', 'xCareers', 'evacuatejobs', 'alfadigital_jobs',
 ]
 # Убраны как нечитаемые через t.me/s/ (это чаты/группы, не каналы-вещатели):
 #   rabotaICL, products_jobs — смотреть вручную.
+#   jobstobefoundJobs, mtsfintechjobs — unavailable (0 постов, не читаются через t.me/s/).
 # Глубина чтения телеграма:
 DEEP_FIRST_RUN = True     # первый прогон - глубже (листать ленту назад)
 TG_DEEP_PAGES = 8         # сколько "страниц" ленты назад тянуть в глубоком режиме
