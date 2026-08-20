@@ -1,0 +1,6 @@
+[2026-08-20T08:28:37] === Запуск run_all.py ===
+[2026-08-20T08:28:37] START vacancy_collector.py
+[2026-08-20T08:32:51] END vacancy_collector.py OK (код возврата 0)
+[2026-08-20T08:32:51] START llm_scorer.py
+[2026-08-20T08:40:33] END llm_scorer.py OK (код возврата 0)
+[2026-08-20T08:40:33] === run_all.py завершён успешно ===
