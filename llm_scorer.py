@@ -61,13 +61,16 @@ LLM_MODEL = 'deepseek/deepseek-v4-flash'           # ДЁШЕВО, без лим
 # ==========================================================================
 RAW_SHEETS = ['Хабр', 'Телеграм']       # откуда читаем сырьё
 OUT_SHEET = 'Вакансии'                   # куда пишем чистое (в Таблице неудач)
-LOW_SALARY_THRESHOLD = 50000             # ЗП ниже - помечаем флагом
 SLEEP_LLM = 0.6                          # пауза между вызовами LLM
 MAX_PER_RUN = 0                          # 0 = без лимита; >0 = не больше N за прогон (для теста)
 
 # Отсечка по свежести: не оценивать вакансии старше N дней.
 # 0 = не отсекать. Дата не распозналась -> НЕ отсекаем (лучше лишняя, чем потерянная).
 MAX_AGE_DAYS = 10
+
+# Страховочный потолок листа "Вакансии": если после подчистки старья строк
+# всё ещё больше - обрезаем лишние снизу (см. cleanup_old_rows).
+MAX_ROWS = 150
 
 _MONTHS = {'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6,
            'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12}
@@ -114,17 +117,18 @@ BIG_TECH_COLORS = {
     'avito': (0.90, 0.94, 0.85), 'авито': (0.90, 0.94, 0.85),
     'мтс': (1.00, 0.88, 0.90), 'альфа': (0.96, 0.85, 0.85),
 }
-LOW_SALARY_COLOR = (1.00, 0.98, 0.80)   # бледно-жёлтый для низкой ЗП
 
 # Допустимые значения ИЗ ТВОЕГО СПРАВОЧНИКА - LLM выбирает только из них.
 V_GRADE = ['Intern', 'Junior', 'Junior+', 'Middle', 'Senior', 'Lead', 'не указано']
 V_EXP = ['Без опыта', '1-3 года', '3-6 лет', '6+ лет', 'не указано']
 V_FORMAT = ['Офис', 'Удалёнка', 'Гибрид', 'не указано']
 
-# Колонки листа "Вакансии" (перёд - как в Трекере, для копипаста; далее - LLM-поля).
-COLUMNS = ['source_id', '№', 'Компания', 'Должность', 'Опыт (треб.)', 'Грейд',
-           'Источник', 'Формат', 'ЗП вилка', '⚠️ЗП', 'Локация', 'Оценка',
-           'Вердикт', 'Опубликовано', 'Ссылка', 'Комментарий']
+# Колонки листа "Вакансии". source_id - технический ключ дедупа (колонка A,
+# скрыта в UI, но остаётся в данных). Просмотрено - чекбокс, последняя колонка,
+# чтобы не сбивать чтение данных и дедуп по колонке A.
+COLUMNS = ['source_id', 'Компания', 'Должность', 'Опыт (треб.)', 'Грейд',
+           'Источник', 'Формат', 'ЗП вилка', 'Локация', 'Оценка',
+           'Вердикт', 'Опубликовано', 'Ссылка', 'Комментарий', 'Просмотрено']
 
 # ==========================================================================
 # ПРОФИЛЬ КАНДИДАТА для промпта (правь под себя)
@@ -243,14 +247,6 @@ def pick(value, allowed, default='не указано'):
         return _SYNONYMS[nv]
     return default
 
-def low_salary_flag(salary_min):
-    try:
-        if salary_min is None:
-            return ''
-        return '⚠️ <50k' if float(salary_min) < LOW_SALARY_THRESHOLD else ''
-    except (TypeError, ValueError):
-        return ''
-
 # ==========================================================================
 # Retry с экспоненциальной задержкой (для нестабильных внешних сервисов)
 # ==========================================================================
@@ -331,7 +327,7 @@ def existing_ids(ws):
     vals = with_retry(lambda: ws.get_all_values(), what="чтение существующих ID")
     return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
 
-def build_row(num, item, data):
+def build_row(item, data):
     def g(key, default='не указано'):
         v = data.get(key)
         return v if v not in (None, '') else default
@@ -343,16 +339,13 @@ def build_row(num, item, data):
     if len(verdict) > 200:                       # ровные строки: длинный вердикт обрезаем
         verdict = verdict[:200].rstrip() + '…'
     return [
-        item['source_id'], num, company, g('title'),
-        exp, grade, item['src'], fmt, g('salary'),
-        low_salary_flag(data.get('salary_min')), g('location'),
+        item['source_id'], company, g('title'),
+        exp, grade, item['src'], fmt, g('salary'), g('location'),
         g('score', ''), verdict,
-        item['published'], item['url'], '',
+        item['published'], item['url'], '', '',
     ]
 
-def color_for(company, low_flag):
-    if low_flag:
-        return LOW_SALARY_COLOR
+def color_for(company):
     c = (company or '').lower()          # None-safe: пустая компания не роняет
     if not c:
         return None
@@ -385,7 +378,9 @@ def style_sheet(ws, n_rows):
     except Exception:
         pass
     # ширины колонок под содержимое (через batch-запрос к Sheets API)
-    widths = [0, 40, 130, 240, 90, 70, 110, 90, 130, 70, 150, 60, 320, 100, 60, 200]
+    # source_id, Компания, Должность, Опыт, Грейд, Источник, Формат, ЗП вилка,
+    # Локация, Оценка, Вердикт, Опубликовано, Ссылка, Комментарий, Просмотрено
+    widths = [80, 130, 240, 90, 70, 110, 90, 130, 150, 60, 320, 100, 60, 200, 90]
     reqs = []
     sid = ws.id
     for i, w in enumerate(widths):
@@ -394,26 +389,88 @@ def style_sheet(ws, n_rows):
                 'range': {'sheetId': sid, 'dimension': 'COLUMNS',
                           'startIndex': i, 'endIndex': i + 1},
                 'properties': {'pixelSize': w}, 'fields': 'pixelSize'}})
-    # перенос текста в колонках Должность(D=3) и Вердикт(M=12), выравнивание вверх
-    for ci in (3, 12):
+    # source_id остаётся в данных (дедуп), но скрыт от глаз в UI
+    reqs.append({'updateDimensionProperties': {
+        'range': {'sheetId': sid, 'dimension': 'COLUMNS',
+                  'startIndex': COLUMNS.index('source_id'),
+                  'endIndex': COLUMNS.index('source_id') + 1},
+        'properties': {'hiddenByUser': True}, 'fields': 'hiddenByUser'}})
+    # перенос текста в колонках Должность и Вердикт, выравнивание вверх
+    for ci in (COLUMNS.index('Должность'), COLUMNS.index('Вердикт')):
         reqs.append({'repeatCell': {
             'range': {'sheetId': sid, 'startRowIndex': 1,
                       'startColumnIndex': ci, 'endColumnIndex': ci + 1},
             'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP',
                                            'verticalAlignment': 'TOP'}},
             'fields': 'userEnteredFormat(wrapStrategy,verticalAlignment)'}})
-    # сортировка данных по Оценке (колонка L=11) убыв. - топ сверху.
+    # чекбоксы в колонке "Просмотрено" (данные + запас до конца текущего диапазона)
+    seen_idx = COLUMNS.index('Просмотрено')
+    reqs.append({'setDataValidation': {
+        'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': max(n_rows, 1) + 1,
+                  'startColumnIndex': seen_idx, 'endColumnIndex': seen_idx + 1},
+        'rule': {'condition': {'type': 'BOOLEAN'}, 'strict': True}}})
+    # сортировка: непросмотренные (чекбокс снят) сверху, внутри - по Оценке убыв.
     # Сортируем весь диапазон строк целиком -> Комментарий и подсветка едут со строкой.
     if n_rows > 1:
         reqs.append({'sortRange': {
             'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': n_rows,
                       'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)},
-            'sortSpecs': [{'dimensionIndex': 11, 'sortOrder': 'DESCENDING'}]}})
+            'sortSpecs': [
+                {'dimensionIndex': seen_idx, 'sortOrder': 'ASCENDING'},
+                {'dimensionIndex': COLUMNS.index('Оценка'), 'sortOrder': 'DESCENDING'},
+            ]}})
     if reqs:
         try:
             ws.spreadsheet.batch_update({'requests': reqs})
         except Exception as e:
             print(f'  [оформление] часть стилей не применилась: {e}')
+
+def cleanup_old_rows(ws):
+    """Разгрузка листа: удаляет строки старше MAX_AGE_DAYS (по 'Опубликовано'),
+    затем страховочный cap - если данных всё ещё > MAX_ROWS, обрезает лишние
+    снизу (после сортировки непросмотренные-сверху/оценка-убыв, режутся низкие
+    непросмотренные и все просмотренные). Нераспознанная дата -> НЕ удаляем.
+    Источники сырья (Хабр/Телеграм) не трогаем - дедуп остаётся по source_id."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа перед подчисткой")
+    if len(vals) <= 1:
+        return
+    pub_idx = COLUMNS.index('Опубликовано')
+    to_delete = [i for i, row in enumerate(vals[1:], start=2)
+                 if too_old(row[pub_idx] if len(row) > pub_idx else '')]
+    sid = ws.id
+    if to_delete:
+        reqs = [{'deleteDimension': {
+            'range': {'sheetId': sid, 'dimension': 'ROWS',
+                      'startIndex': rownum - 1, 'endIndex': rownum}}}
+                for rownum in sorted(to_delete, reverse=True)]
+        try:
+            ws.spreadsheet.batch_update({'requests': reqs})
+            print(f'  [подчистка] удалено старых строк (>{MAX_AGE_DAYS}д): {len(to_delete)}')
+        except Exception as e:
+            print(f'  [подчистка] не удалось удалить старые строки: {e}')
+
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа после подчистки старья")
+    n_data = len(vals) - 1
+    if n_data > MAX_ROWS:
+        seen_idx = COLUMNS.index('Просмотрено')
+        score_idx = COLUMNS.index('Оценка')
+        reqs = [
+            {'sortRange': {
+                'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': 1 + n_data,
+                          'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)},
+                'sortSpecs': [
+                    {'dimensionIndex': seen_idx, 'sortOrder': 'ASCENDING'},
+                    {'dimensionIndex': score_idx, 'sortOrder': 'DESCENDING'},
+                ]}},
+            {'deleteDimension': {
+                'range': {'sheetId': sid, 'dimension': 'ROWS',
+                          'startIndex': 1 + MAX_ROWS, 'endIndex': 1 + n_data}}},
+        ]
+        try:
+            ws.spreadsheet.batch_update({'requests': reqs})
+            print(f'  [подчистка] cap {MAX_ROWS}: удалено лишних строк: {n_data - MAX_ROWS}')
+        except Exception as e:
+            print(f'  [подчистка] cap не применился: {e}')
 
 # ==========================================================================
 # Телеграм-счётчик
@@ -469,11 +526,19 @@ def main():
         if is_vac in ('false', 'нет', '0', 'no'):
             skipped_junk += 1
             continue
+        # мусорная оценка (0-1) - не засоряем лист. Нераспознанный score -> не отсекаем.
+        try:
+            score_num = float(data.get('score'))
+        except (TypeError, ValueError):
+            score_num = None
+        if score_num is not None and score_num < 2:
+            skipped_junk += 1
+            continue
         num += 1
-        row = build_row(num, it, data)
+        row = build_row(it, data)
         with_retry(lambda row=row: ws.append_row(row, value_input_option='USER_ENTERED'),
                   what="запись строки в лист")
-        rgb = color_for(data.get('company'), row[9])
+        rgb = color_for(data.get('company'))
         if rgb:
             fill_row(ws, start_row + added, rgb)
         added += 1
@@ -482,6 +547,7 @@ def main():
     print(f'  отсеяно (не вакансия/без ответа): {skipped_junk}')
 
     notify_count(added)
+    cleanup_old_rows(ws)
     total_rows = len(with_retry(lambda: ws.get_all_values(), what="чтение листа перед оформлением"))
     style_sheet(ws, total_rows)
     print(f'\nЗвено 2 готово. Оценено и записано: {added}. Прогон: {dt.date.today().isoformat()}')
