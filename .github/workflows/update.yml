@@ -27,3 +27,5 @@ jobs:
           TRACKER_SPREADSHEET_ID: ${{ secrets.TRACKER_SPREADSHEET_ID }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CREDENTIALS_FILE: credentials.json
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
