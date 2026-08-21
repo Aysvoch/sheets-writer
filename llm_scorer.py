@@ -68,6 +68,10 @@ MAX_PER_RUN = 0                          # 0 = без лимита; >0 = не б
 # 0 = не отсекать. Дата не распозналась -> НЕ отсекаем (лучше лишняя, чем потерянная).
 MAX_AGE_DAYS = 10
 
+# Отсечка по оценке: в лист попадают только score >= MIN_SCORE.
+# Нераспознанный score (LLM вернул не число) -> НЕ отсекаем (лучше лишняя, чем потерянная).
+MIN_SCORE = 3
+
 # Страховочный потолок листа "Вакансии": если после подчистки старья строк
 # всё ещё больше - обрезаем лишние снизу (см. cleanup_old_rows).
 MAX_ROWS = 150
@@ -426,22 +430,6 @@ def build_row(item, data):
         item['published'], item['url'], '', '',
     ]
 
-def color_for(company):
-    c = (company or '').lower()          # None-safe: пустая компания не роняет
-    if not c:
-        return None
-    for key, rgb in BIG_TECH_COLORS.items():
-        if key in c:
-            return rgb
-    return None
-
-def fill_row(ws, rownum, rgb):
-    last = col_to_letter(len(COLUMNS) - 1)
-    with_retry(lambda: ws.format(
-        f'A{rownum}:{last}{rownum}',
-        {'backgroundColor': {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}}
-    ), what="подсветка строки")
-
 def col_to_letter(idx):
     """0-based индекс колонки -> буква(ы) Google Sheets (0->A, 25->Z, 26->AA, 27->AB...)."""
     letters = ''
@@ -452,7 +440,9 @@ def col_to_letter(idx):
     return letters
 
 def style_sheet(ws, n_rows):
-    """Оформление под Дашборд: тёмная шапка, границы, ширины, закрепление, автофильтр."""
+    """Оформление под Дашборд: тёмная шапка, ширины, wrap, закрепление, автофильтр,
+    чекбокс "Просмотрено" и три условных правила подсветки. Зовётся каждый прогон,
+    поэтому все настройки держатся даже после пересоздания листа с нуля."""
     last = col_to_letter(len(COLUMNS) - 1)
     # тёмная шапка с белым жирным текстом (как заголовки Дашборда)
     ws.format(f'A1:{last}1', {
@@ -470,8 +460,7 @@ def style_sheet(ws, n_rows):
     # ширины колонок под содержимое (через batch-запрос к Sheets API)
     # source_id, Компания, Должность, Опыт, Грейд, Источник, Формат, ЗП вилка,
     # Локация, Оценка, Вердикт, Опубликовано, Ссылка, Комментарий, Просмотрено
-    widths = [80, 130, 240, 90, 70, 110, 90, 130, 150, 60, 320, 100, 60, 200, 90]
-    widths[COLUMNS.index('Формат')] = 100   # "Удалёнка"/"Гибрид" не должны обрезаться
+    widths = [80, 170, 170, 80, 80, 110, 90, 130, 150, 80, 320, 100, 100, 300, 90]
     reqs = []
     sid = ws.id
     for i, w in enumerate(widths):
@@ -486,48 +475,102 @@ def style_sheet(ws, n_rows):
                   'startIndex': COLUMNS.index('source_id'),
                   'endIndex': COLUMNS.index('source_id') + 1},
         'properties': {'hiddenByUser': True}, 'fields': 'hiddenByUser'}})
-    # перенос текста в колонках Должность и Вердикт, выравнивание вверх
-    for ci in (COLUMNS.index('Должность'), COLUMNS.index('Вердикт')):
-        reqs.append({'repeatCell': {
-            'range': {'sheetId': sid, 'startRowIndex': 1,
-                      'startColumnIndex': ci, 'endColumnIndex': ci + 1},
-            'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP',
-                                           'verticalAlignment': 'TOP'}},
-            'fields': 'userEnteredFormat(wrapStrategy,verticalAlignment)'}})
-    # чекбоксы РОВНО в колонке "Просмотрено" - ни шире, ни на соседнюю колонку
+    # перенос текста + выравнивание вверх во всех колонках данных
+    reqs.append({'repeatCell': {
+        'range': {'sheetId': sid, 'startRowIndex': 1,
+                  'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)},
+        'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP', 'verticalAlignment': 'TOP'}},
+        'fields': 'userEnteredFormat(wrapStrategy,verticalAlignment)'}})
+
+    data_end_row = max(n_rows, 1) + 1     # 0-based exclusive, чуть шире текущих данных
     seen_idx = COLUMNS.index('Просмотрено')
-    reqs.append({'setDataValidation': {
-        'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': max(n_rows, 1) + 1,
-                  'startColumnIndex': seen_idx, 'endColumnIndex': seen_idx + 1},
-        'rule': {'condition': {'type': 'BOOLEAN'}, 'strict': True}}})
-    # подсветка просмотренных: условное форматирование, реагирует на клик по чекбоксу
-    # (не разовая покраска при записи). Сначала убираем старые правила подсветки этого
-    # листа (иначе они копятся с каждым прогоном), потом ставим одно свежее.
-    seen_col = col_to_letter(seen_idx)
-    cf_range = {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': max(n_rows, 1) + 1,
-                'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)}
+
+    # Читаем метаданные листа: реальные размеры грида (чтобы стереть ЛЮБУЮ старую
+    # data validation по всему листу, а не только в границах текущих данных) и
+    # список текущих правил подсветки (чтобы не копить дубликаты с каждым прогоном).
+    #
+    # ИСТОЧНИК БАГА "лишний чекбокс P без заголовка": код всегда чистил старые
+    # ПРАВИЛА ПОДСВЕТКИ (conditionalFormats) перед тем как поставить новые, но
+    # ни разу не чистил ПРАВИЛА ВАЛИДАЦИИ (setDataValidation) - только добавлял
+    # свежую BOOLEAN-валидацию на нужную колонку поверх. Любая validation-рамка,
+    # когда-то повисшая на другой колонке (лист чистился очисткой содержимого,
+    # а не пересозданием вкладки; либо более старая версия COLUMNS сдвигала
+    # "Просмотрено" на другую букву), никогда не удалялась и рисовала свой
+    # чекбокс вечно. Чинится ниже: сначала стираем validation по всему гриду,
+    # потом ставим ровно одну - на COLUMNS.index('Просмотрено').
+    clear_cols, clear_rows = len(COLUMNS), data_end_row
     try:
         meta = ws.spreadsheet.fetch_sheet_metadata(
-            params={'fields': 'sheets(properties(sheetId),conditionalFormats)'})
+            params={'fields': 'sheets(properties(sheetId,gridProperties),conditionalFormats)'})
         for sheet in meta.get('sheets', []):
-            if sheet.get('properties', {}).get('sheetId') == sid:
-                n_cf = len(sheet.get('conditionalFormats', []))
-                for i in range(n_cf - 1, -1, -1):
-                    reqs.append({'deleteConditionalFormatRule': {'sheetId': sid, 'index': i}})
-                break
+            props = sheet.get('properties', {})
+            if props.get('sheetId') != sid:
+                continue
+            gp = props.get('gridProperties', {})
+            clear_cols = max(clear_cols, gp.get('columnCount', clear_cols))
+            clear_rows = max(clear_rows, gp.get('rowCount', clear_rows))
+            n_cf = len(sheet.get('conditionalFormats', []))
+            for i in range(n_cf - 1, -1, -1):
+                reqs.append({'deleteConditionalFormatRule': {'sheetId': sid, 'index': i}})
+            break
     except Exception as e:
-        print(f'  [оформление] не удалось прочитать старые правила подсветки: {e}')
-    reqs.append({'addConditionalFormatRule': {
-        'rule': {
-            'ranges': [cf_range],
-            'booleanRule': {
-                'condition': {'type': 'CUSTOM_FORMULA',
-                              'values': [{'userEnteredValue': f'=${seen_col}2=TRUE'}]},
-                'format': {'backgroundColor': {'red': 0.85, 'green': 0.94, 'blue': 0.85}},
-            },
-        },
-        'index': 0,
-    }})
+        print(f'  [оформление] не удалось прочитать метаданные листа: {e}')
+
+    reqs.append({'setDataValidation': {
+        'range': {'sheetId': sid, 'startRowIndex': 0, 'endRowIndex': clear_rows,
+                  'startColumnIndex': 0, 'endColumnIndex': clear_cols},
+        'rule': None}})
+    # чекбокс РОВНО в колонке "Просмотрено" - ни шире, ни на соседнюю колонку
+    reqs.append({'setDataValidation': {
+        'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': data_end_row,
+                  'startColumnIndex': seen_idx, 'endColumnIndex': seen_idx + 1},
+        'rule': {'condition': {'type': 'BOOLEAN'}, 'strict': True}}})
+
+    # Три подсветки - ВСЕ условными правилами (addConditionalFormatRule), с явным
+    # порядком приоритета (Sheets красит по ПЕРВОМУ сматчившемуся правилу):
+    #   1 (высший) - шкала "Оценка", красит только саму ячейку оценки;
+    #   2 - просмотренное (чекбокс=TRUE) - вся строка бледно-зелёная;
+    #   3 (низший) - бигтех - вся строка цветом компании.
+    # Порядок гарантирует: оценка всегда своего цвета; просмотренное перекрывает
+    # бигтех; бигтех красит только непросмотренные строки известных компаний.
+    cf_index = [0]
+    def add_cf(rng, condition, rgb):
+        reqs.append({'addConditionalFormatRule': {
+            'rule': {'ranges': [rng], 'booleanRule': {
+                'condition': condition,
+                'format': {'backgroundColor': {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}}}},
+            'index': cf_index[0]}})
+        cf_index[0] += 1
+
+    score_idx = COLUMNS.index('Оценка')
+    score_range = {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': data_end_row,
+                   'startColumnIndex': score_idx, 'endColumnIndex': score_idx + 1}
+    for lo, hi, rgb in ((8, 10, (0.65, 0.85, 0.62)),
+                        (6, 7, (0.85, 0.94, 0.80)),
+                        (3, 5, (1.00, 0.95, 0.75))):
+        add_cf(score_range,
+              {'type': 'NUMBER_BETWEEN',
+               'values': [{'userEnteredValue': str(lo)}, {'userEnteredValue': str(hi)}]},
+              rgb)
+
+    row_range = {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': data_end_row,
+                'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)}
+    seen_col = col_to_letter(seen_idx)
+    add_cf(row_range,
+          {'type': 'CUSTOM_FORMULA', 'values': [{'userEnteredValue': f'=${seen_col}2=TRUE'}]},
+          (0.85, 0.94, 0.85))
+
+    comp_col = col_to_letter(COLUMNS.index('Компания'))
+    groups = {}
+    for name, rgb in BIG_TECH_COLORS.items():
+        groups.setdefault(rgb, []).append(name)
+    for rgb, names in groups.items():
+        pattern = '|'.join(re.escape(name) for name in names)
+        add_cf(row_range,
+              {'type': 'CUSTOM_FORMULA',
+               'values': [{'userEnteredValue': f'=REGEXMATCH(LOWER(${comp_col}2),"{pattern}")'}]},
+              rgb)
+
     # сортировка: непросмотренные (чекбокс снят) сверху, внутри - по Оценке убыв.
     # Сортируем весь диапазон строк целиком -> Комментарий и подсветка едут со строкой.
     if n_rows > 1:
@@ -628,12 +671,10 @@ def main():
     print(f'  всего в сырье: {len(items)}, уже оценено: {len(have)}, '
           f'старше {MAX_AGE_DAYS}д пропущено: {skipped_old}, к оценке: {len(todo)}')
 
-    start_row = len(with_retry(lambda: ws.get_all_values(),
-                               what="чтение листа перед записью")) + 1   # с какой строки дописываем
     num = len(have)
     added = 0
     skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
-    skipped_low_score = 0       # реальная вакансия, но score < 2 - не мой профиль
+    skipped_low_score = 0       # реальная вакансия, но score < MIN_SCORE - не мой профиль
     llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
     for it in todo:
         data, fail_reason = llm_evaluate(it['text'])
@@ -647,21 +688,18 @@ def main():
         if is_vac in ('false', 'нет', '0', 'no'):
             skipped_non_vacancy += 1
             continue
-        # мусорная оценка (0-1) - не засоряем лист. Нераспознанный score -> не отсекаем.
+        # низкая оценка (< MIN_SCORE) - не засоряем лист. Нераспознанный score -> не отсекаем.
         try:
             score_num = float(data.get('score'))
         except (TypeError, ValueError):
             score_num = None
-        if score_num is not None and score_num < 2:
+        if score_num is not None and score_num < MIN_SCORE:
             skipped_low_score += 1
             continue
         num += 1
         row = build_row(it, data)
         with_retry(lambda row=row: ws.append_row(row, value_input_option='USER_ENTERED'),
                   what="запись строки в лист")
-        rgb = color_for(data.get('company'))
-        if rgb:
-            fill_row(ws, start_row + added, rgb)
         added += 1
         print(f'  [{num}] {str(data.get("score","?")):>2}/10 | {str(data.get("company") or "")[:18]:18} | {str(data.get("title") or "")[:40]}')
 
