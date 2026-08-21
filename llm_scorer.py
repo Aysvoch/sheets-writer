@@ -158,7 +158,6 @@ SYSTEM_PROMPT = f"""Ты - строгий ассистент по подбору
   "grade": "одно из: {V_GRADE}",
   "format": "одно из: {V_FORMAT}",
   "salary": "вилка как в тексте (например '80000-120000 RUB') или 'не указано'",
-  "salary_min": "минимум зарплаты числом в рублях, или null если не указано/не в рублях",
   "location": "город/условия или 'не указано'",
   "score": "целое 0-10, насколько подходит кандидату (10=идеально, 0=совсем нет)",
   "verdict": "1 сухое предложение почему такая оценка, максимум 25 слов"
@@ -166,11 +165,48 @@ SYSTEM_PROMPT = f"""Ты - строгий ассистент по подбору
 Оценку занижай для Senior/Lead, требований 5+ лет, нерелевантных доменов;
 повышай для junior/intern/стажировок в продукте с удалёнкой или в Казани/Москве."""
 
+# JSON-схема ответа. OpenRouter направит запрос провайдеру, который её держит
+# (см. provider=require_parameters в теле). Грейд/Формат/Опыт заданы enum'ом строго
+# из Справочника - модель обязана вернуть одно из допустимых, pick() остаётся страховкой.
+RESPONSE_FORMAT = {
+    'type': 'json_schema',
+    'json_schema': {
+        'name': 'vacancy_eval',
+        'strict': True,
+        'schema': {
+            'type': 'object',
+            'additionalProperties': False,
+            'properties': {
+                'is_vacancy': {'type': 'boolean'},
+                'company':    {'type': 'string'},
+                'title':      {'type': 'string'},
+                'experience': {'type': 'string', 'enum': V_EXP},
+                'grade':      {'type': 'string', 'enum': V_GRADE},
+                'format':     {'type': 'string', 'enum': V_FORMAT},
+                'salary':     {'type': 'string'},
+                'location':   {'type': 'string'},
+                'score':      {'type': 'integer', 'minimum': 0, 'maximum': 10},
+                'verdict':    {'type': 'string'},
+            },
+            'required': ['is_vacancy', 'company', 'title', 'experience', 'grade',
+                         'format', 'salary', 'location', 'score', 'verdict'],
+        },
+    },
+}
+
 # ==========================================================================
 # LLM через OpenRouter
 # ==========================================================================
 LLM_TRIES = 3                  # макс. попыток вызова OpenRouter, потом честно сдаёмся
 LLM_RETRY_DELAYS = [2, 4]       # паузы между попытками (сек)
+
+def truncate_for_llm(text, limit=4000, head=2500, tail=1500):
+    """Длинный пост режем на начало+конец, а не просто [:limit]. Зарплата, опыт и
+    ссылка часто в хвосте поста - [:limit] бы их потерял. Короткий текст - как есть."""
+    text = text or ''
+    if len(text) <= limit:
+        return text
+    return text[:head] + '\n\n[…текст сокращён…]\n\n' + text[-tail:]
 
 def llm_evaluate(vacancy_text):
     """Возвращает (dict полей, None) при успехе или (None, причина) при неудаче
@@ -179,10 +215,16 @@ def llm_evaluate(vacancy_text):
         'model': LLM_MODEL,
         'messages': [
             {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': f'Текст вакансии:\n{vacancy_text[:4000]}'},
+            {'role': 'user', 'content': f'Текст вакансии:\n{truncate_for_llm(vacancy_text)}'},
         ],
         'temperature': 0,               # без фантазии - максимально детерминированно
-        'max_tokens': 400,
+        'max_tokens': 1200,             # было 800 - длинные JSON типа А обрывались
+        'response_format': RESPONSE_FORMAT,        # форсим валидный JSON по схеме
+        'provider': {'require_parameters': True},  # только провайдер, который держит схему
+        # reasoning гасим: задача классификационная, «размышления» только жрут бюджет
+        # токенов и текут в content вместо JSON. {'enabled': False} модель игнорирует
+        # и рассуждения текут в content - используем {'exclude': True} (думает молча).
+        'reasoning': {'exclude': True},
     }
     headers = {
         'Authorization': f'Bearer {OPENROUTER_API_KEY}',
@@ -191,34 +233,40 @@ def llm_evaluate(vacancy_text):
     }
     reason = 'LLM ошибка'
     for attempt in range(1, LLM_TRIES + 1):
+        retryable = True                 # ретраим только сеть/429/5xx; парс и 4xx - нет
         try:
             r = requests.post('https://openrouter.ai/api/v1/chat/completions',
                               json=body, headers=headers, timeout=60)
-        except requests.exceptions.Timeout:
-            reason = 'LLM таймаут/сеть'
         except requests.exceptions.RequestException:
             reason = 'LLM таймаут/сеть'
         else:
-            if r.status_code != 200:
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                reason = f'LLM HTTP {r.status_code}'          # временное - повтор уместен
+            elif r.status_code != 200:
+                # 4xx (напр. схема не поддержана провайдером) - повтор не поможет
                 reason = f'LLM HTTP {r.status_code}'
+                retryable = False
             else:
                 try:
                     j = r.json()
                 except ValueError:
-                    reason = 'LLM битый JSON'
+                    reason = 'LLM битый ответ'; retryable = False
                 else:
                     choices = j.get('choices') or []
                     msg = choices[0].get('message', {}) or {} if choices else {}
                     content = msg.get('content') or msg.get('reasoning') or ''
                     if not content:
-                        reason = 'LLM пустой ответ'
+                        reason = 'LLM пустой ответ'; retryable = False
                     else:
                         data = parse_llm_json(content)
                         if data is None:
-                            reason = 'LLM битый JSON'
+                            # при temperature=0 повтор даст тот же битый ответ - не тратим попытки
+                            reason = 'LLM битый JSON'; retryable = False
                         else:
                             time.sleep(SLEEP_LLM)
                             return data, None
+        if not retryable:
+            break
         if attempt < LLM_TRIES:
             delay = LLM_RETRY_DELAYS[attempt - 1]
             print(f'    [LLM] попытка {attempt}/{LLM_TRIES} не удалась ({reason}), '
@@ -227,16 +275,30 @@ def llm_evaluate(vacancy_text):
     return None, reason
 
 def parse_llm_json(content):
-    """Достаёт JSON даже если модель обернула его в markdown/текст. None-safe."""
+    """Достаёт ПЕРВЫЙ сбалансированный JSON-объект, даже если вокруг текст/markdown.
+    None, если объекта нет или он оборван (незакрытая скобка = упор в max_tokens).
+    Надёжнее жадного \\{.*\\}: тот брал от первой { до последней } и падал на обрыве."""
     if not content or not isinstance(content, str):
         return None
-    m = re.search(r'\{.*\}', content, re.S)
-    if not m:
+    s = content.strip()
+    if s.startswith('```'):
+        s = s.strip('`')
+    start = s.find('{')
+    if start == -1:
         return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
+    depth = 0
+    for i in range(start, len(s)):
+        c = s[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(s[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None  # скобка не закрылась -> ответ обрезан, подними max_tokens
 
 # ==========================================================================
 # Нормализация под Справочник (чтобы совпадало с выпадающими списками)
@@ -570,18 +632,20 @@ def main():
                                what="чтение листа перед записью")) + 1   # с какой строки дописываем
     num = len(have)
     added = 0
-    skipped_junk = 0
+    skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
+    skipped_low_score = 0       # реальная вакансия, но score < 2 - не мой профиль
+    llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
     for it in todo:
         data, fail_reason = llm_evaluate(it['text'])
         if not data:
-            # LLM не ответил после всех попыток - НЕ пишем, попадёт на повтор в след. прогон
-            skipped_junk += 1
+            # сбой LLM (не «мусор») - НЕ пишем, вернётся на повтор в след. прогон
+            llm_errors += 1
             print(f'    пропуск ({fail_reason}): {it["source_id"]}')
             continue
         # не одиночная вакансия (дайджест/инфопост/реклама) - не засоряем лист
         is_vac = str(data.get('is_vacancy', 'true')).strip().lower()
         if is_vac in ('false', 'нет', '0', 'no'):
-            skipped_junk += 1
+            skipped_non_vacancy += 1
             continue
         # мусорная оценка (0-1) - не засоряем лист. Нераспознанный score -> не отсекаем.
         try:
@@ -589,7 +653,7 @@ def main():
         except (TypeError, ValueError):
             score_num = None
         if score_num is not None and score_num < 2:
-            skipped_junk += 1
+            skipped_low_score += 1
             continue
         num += 1
         row = build_row(it, data)
@@ -601,7 +665,8 @@ def main():
         added += 1
         print(f'  [{num}] {str(data.get("score","?")):>2}/10 | {str(data.get("company") or "")[:18]:18} | {str(data.get("title") or "")[:40]}')
 
-    print(f'  отсеяно (не вакансия/без ответа): {skipped_junk}')
+    print(f'  итог по прогону: записано {added}, не вакансия {skipped_non_vacancy}, '
+          f'низкий score {skipped_low_score}, ошибки LLM {llm_errors}')
 
     notify_count(added)
     cleanup_old_rows(ws)
