@@ -716,7 +716,13 @@ def main():
             continue
         num += 1
         row = build_row(it, data)
-        with_retry(lambda row=row: ws.append_row(row, value_input_option='USER_ENTERED'),
+        # explicit A{n}:O{n} вместо append_row: серверный авто-детект таблицы
+        # у append_row пропускает скрытую колонку A (hiddenByUser) и съезжает
+        # на B, сдвигая весь row на +1 (source_id мимо A, дедуп по r[0] ломается).
+        last_col = col_to_letter(len(COLUMNS) - 1)
+        target_range = f'A{num + 1}:{last_col}{num + 1}'
+        with_retry(lambda row=row, rng=target_range: ws.update(
+            [row], rng, value_input_option='USER_ENTERED'),
                   what="запись строки в лист")
         rgb = color_for_company(row[COLUMNS.index('Компания')])
         if rgb:
