@@ -90,4 +90,4 @@ Python, нейросеть через OpenRouter, Google Таблицы, зап�
 
 ## Автор
 
-Андрей · [Приватный эфир](https://t.me/Private_ether)
+Андрей · Телеграм канал: [Приватный эфир](https://t.me/Private_ether)
