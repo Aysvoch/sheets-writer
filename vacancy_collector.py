@@ -58,15 +58,15 @@ HABR_MAX_PAGES = 5                     # сколько страниц на за
 
 # --- Телеграм: каналы. Добавить источник = дописать строку. ---
 TG_CHANNELS = [
-    'yuniorapp', 'workayte', 'bigtechjobs',
-    'futru_it', 'itshka_v_sbere', 'young_june', 'habr_career',
-    'juno_jobs', 'juniors_rabota_jobs', 'proglib_jobs', 'young_intern',
-    'enter_career', 'IUCareerFinder', 'forproducts', 'product_jobs',
-    'hireproproduct', 'jobs_for_products', 'hh_vacancy_product_project',
-    'productconsult', 'jobforjunior', 'remotejun', 'grinternru',
-    'workvc', 'hsecareer', 'huggabletalents', 'ya_jobs_pm',
-    'digital_hr', 'geekjobs', 'mnogovakansiy', 'jobtalker', 'cozy_hr',
-    'xCareers', 'evacuatejobs', 'alfadigital_jobs',
+    'yuniorapp', 'workayte', 'bigtechjobs', 'futru_it', 'itshka_v_sbere',
+    'young_june', 'habr_career', 'juno_jobs', 'juniors_rabota_jobs',
+    'proglib_jobs', 'young_intern', 'enter_career', 'IUCareerFinder',
+    'forproducts', 'product_jobs', 'hireproproduct', 'jobs_for_products',
+    'hh_vacancy_product_project', 'productconsult', 'jobforjunior',
+    'remotejun', 'grinternru', 'workvc', 'hsecareer', 'huggabletalents',
+    'ya_jobs_pm', 'digital_hr', 'geekjobs', 'mnogovakansiy', 'jobtalker',
+    'cozy_hr', 'xCareers', 'evacuatejobs', 'alfadigital_jobs',
+    'changellenge', 'offervacancy', 'avito_career', 'futru',
 ]
 # Убраны как нечитаемые через t.me/s/ (это чаты/группы, не каналы-вещатели):
 #   rabotaICL, products_jobs — смотреть вручную.
