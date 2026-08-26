@@ -656,11 +656,15 @@ def cleanup_old_rows(ws):
 # Телеграм-счётчик
 # ==========================================================================
 def notify_count(n):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID or n == 0:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
+    if n > 0:
+        text = f'🎯 Что-то подъехало: {n}'
+    else:
+        text = 'Пу-пу-пуу, пока тишина 🤷'
     try:
         requests.post(f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage',
-                      json={'chat_id': TG_CHAT_ID, 'text': f'🔔 Новых вакансий: {n}'},
+                      json={'chat_id': TG_CHAT_ID, 'text': text},
                       timeout=30)
     except Exception as e:
         print(f'  [телеграм] не отправлено: {e}')
