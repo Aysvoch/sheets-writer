@@ -23,6 +23,7 @@
 
 import os
 import re
+import html
 import json
 import time
 import datetime as dt
@@ -71,6 +72,7 @@ MAX_AGE_DAYS = 10
 # Отсечка по оценке: в лист попадают только score >= MIN_SCORE.
 # Нераспознанный score (LLM вернул не число) -> НЕ отсекаем (лучше лишняя, чем потерянная).
 MIN_SCORE = 3
+NOTIFY_DETAIL_SCORE = 7   # вакансии с оценкой >= этого попадают в текст уведомления с деталями
 
 # Страховочный потолок листа "Вакансии": если после подчистки старья строк
 # всё ещё больше - обрезаем лишние снизу (см. cleanup_old_rows).
@@ -655,16 +657,26 @@ def cleanup_old_rows(ws):
 # ==========================================================================
 # Телеграм-счётчик
 # ==========================================================================
-def notify_count(n):
+def notify_count(n, top=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     if n > 0:
-        text = f'🎯 Что-то подъехало: {n}'
+        lines = [f'🎯 Что-то подъехало: {n}']
+        for v in (top or []):
+            title = v['title'] if len(v['title']) <= 40 else v['title'][:40].rstrip() + '…'
+            parts = [p for p in (v['company'], v['format'], v['location'])
+                     if p and p != 'не указано']
+            tail = ' · '.join(parts)
+            link = f'<a href=\"{html.escape(v["url"], quote=True)}\">{html.escape(title)}</a>'
+            line = f'• {link}' + (f' · {html.escape(tail)}' if tail else '')
+            lines.append(line)
+        text = '\n'.join(lines)
     else:
         text = 'Пу-пу-пуу, пока тишина 🤷'
     try:
         requests.post(f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage',
-                      json={'chat_id': TG_CHAT_ID, 'text': text},
+                      json={'chat_id': TG_CHAT_ID, 'text': text,
+                            'parse_mode': 'HTML', 'disable_web_page_preview': True},
                       timeout=30)
     except Exception as e:
         print(f'  [телеграм] не отправлено: {e}')
@@ -695,6 +707,7 @@ def main():
 
     num = len(have)
     added = 0
+    notify_top = []
     skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
     skipped_low_score = 0       # реальная вакансия, но score < MIN_SCORE - не мой профиль
     llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
@@ -733,11 +746,21 @@ def main():
             fill_row(ws, num + 1, rgb)     # num+1: заголовок row1 + num дозаписанных строк
         added += 1
         print(f'  [{num}] {str(data.get("score","?")):>2}/10 | {str(data.get("company") or "")[:18]:18} | {str(data.get("title") or "")[:40]}')
+        if score_num is not None and score_num >= NOTIFY_DETAIL_SCORE:
+            notify_top.append({
+                'company': str(data.get('company') or ''),
+                'title': str(data.get('title') or 'вакансия'),
+                'format': str(data.get('format') or ''),
+                'location': str(data.get('location') or ''),
+                'url': it['url'],
+                'score': score_num,
+            })
 
     print(f'  итог по прогону: записано {added}, не вакансия {skipped_non_vacancy}, '
           f'низкий score {skipped_low_score}, ошибки LLM {llm_errors}')
 
-    notify_count(added)
+    notify_top.sort(key=lambda v: v['score'], reverse=True)
+    notify_count(added, notify_top[:10])
     cleanup_old_rows(ws)
     total_rows = len(with_retry(lambda: ws.get_all_values(), what="чтение листа перед оформлением"))
     style_sheet(ws, total_rows)
