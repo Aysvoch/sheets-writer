@@ -30,6 +30,8 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+SOURCE_MAX_AGE_DAYS = 12   # сырьё старше стольки дней удаляем из листов-сборщиков
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -339,6 +341,70 @@ def append_new(ws, rows):
         ws.append_rows(rows, value_input_option='USER_ENTERED')
     return len(rows)
 
+def _parse_pub_date(s):
+    """Парсит дату из колонки 'Опубликовано'. Поддерживает '2026-08-12',
+    '2026-08-12 00:00:00' и datetime. Не распознал -> None (строку не трогаем)."""
+    if not s:
+        return None
+    if isinstance(s, dt.datetime):
+        return s.date()
+    if isinstance(s, dt.date):
+        return s
+    txt = str(s).strip()
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+        try:
+            return dt.datetime.strptime(txt[:len(fmt)+2], fmt).date()
+        except ValueError:
+            continue
+    # ISO-подобное начало 'YYYY-MM-DD...'
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', txt)
+    if m:
+        try:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def cleanup_source(ws, cols):
+    """Удаляет из листа-сборщика строки старше SOURCE_MAX_AGE_DAYS по 'Опубликовано'.
+    Нераспознанная дата -> строку НЕ трогаем (безопасность превыше уборки).
+    Никогда не роняет прогон: любые ошибки только логируются."""
+    if not SOURCE_MAX_AGE_DAYS:
+        return
+    try:
+        pub_idx = cols.index('Опубликовано')
+    except ValueError:
+        return
+    try:
+        vals = ws.get_all_values()
+    except Exception as e:
+        print(f'  [подчистка сырья] чтение не удалось: {e}')
+        return
+    if len(vals) <= 1:
+        return
+    today = dt.date.today()
+    to_delete = []
+    for i, row in enumerate(vals[1:], start=2):
+        if len(row) <= pub_idx:
+            continue
+        d = _parse_pub_date(row[pub_idx])
+        if d is not None and (today - d).days > SOURCE_MAX_AGE_DAYS:
+            to_delete.append(i)
+    if not to_delete:
+        return
+    sid = ws.id
+    reqs = [{'deleteDimension': {
+        'range': {'sheetId': sid, 'dimension': 'ROWS',
+                  'startIndex': rownum - 1, 'endIndex': rownum}}}
+            for rownum in sorted(to_delete, reverse=True)]
+    try:
+        ws.spreadsheet.batch_update({'requests': reqs})
+        print(f'  [подчистка сырья] удалено старых строк (>{SOURCE_MAX_AGE_DAYS}д): {len(to_delete)}')
+    except Exception as e:
+        print(f'  [подчистка сырья] не удалось удалить: {e}')
+
+
 # ==========================================================================
 # MAIN
 # ==========================================================================
@@ -358,6 +424,7 @@ def main():
         new = [row_habr(v) for v in vacs if v.source_id not in have]
         n = append_new(ws, new)
         print(f'  собрано: {len(vacs)}, новых записано: {n}')
+        cleanup_source(ws, COLS_HABR)
 
     # --- телеграм ---
     print('Источник [Телеграм]...')
@@ -367,6 +434,7 @@ def main():
     new_tg = [row_tg(v) for v in tg_vacs if v.source_id not in have]
     n_tg = append_new(ws_tg, new_tg)
     print(f'  телеграм всего постов: {len(tg_vacs)}, новых записано: {n_tg}')
+    cleanup_source(ws_tg, COLS_TG)
 
     bad = [f'{ch} ({st})' for ch, st, _ in report if st != 'ok']
     if bad:
