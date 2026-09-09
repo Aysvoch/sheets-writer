@@ -708,6 +708,7 @@ def main():
 
     num = len(have)
     added = 0
+    sheet_rows = ws.row_count   # кэш текущего размера листа для авто-расширения
     notify_top = []
     skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
     skipped_low_score = 0       # реальная вакансия, но score < MIN_SCORE - не мой профиль
@@ -738,6 +739,16 @@ def main():
         # у append_row пропускает скрытую колонку A (hiddenByUser) и съезжает
         # на B, сдвигая весь row на +1 (source_id мимо A, дедуп по r[0] ломается).
         last_col = col_to_letter(len(COLUMNS) - 1)
+        # авто-расширение: гарантируем, что в листе хватает строк под запись в num+1
+        # (лист могли ужать вручную -> ws.update за границей грида падал с 'exceeds grid limits')
+        if num + 1 > sheet_rows:
+            need = num + 1 + 200   # растим пачкой с запасом, чтобы не дёргать API каждую строку
+            try:
+                with_retry(lambda add=need - sheet_rows: ws.add_rows(add),
+                           what="расширение листа под запись")
+                sheet_rows = need
+            except Exception as e:
+                print(f'  [лист] не удалось расширить ({e}), пробую записать как есть')
         target_range = f'A{num + 1}:{last_col}{num + 1}'
         with_retry(lambda row=row, rng=target_range: ws.update(
             [row], rng, value_input_option='USER_ENTERED'),
