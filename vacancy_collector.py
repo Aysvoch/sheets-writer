@@ -310,20 +310,36 @@ COLS_TG = ['source_id', 'Канал', 'Опубликовано', 'Текст', 
            'llm_оценка', 'llm_вердикт', 'Комментарии']
 MANUAL = {'Комментарии', 'llm_оценка', 'llm_вердикт'}   # звено 1 их не трогает
 
+def with_retry(fn, tries=5, base_delay=2, what="операция"):
+    """До 5 попыток с паузами 2/4/8/16с. После последней - падаем с понятной ошибкой.
+    Только для идемпотентных сетевых вызовов (чтение/открытие/append с дедупом)."""
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == tries:
+                print(f"  [retry] {what}: не удалось после {tries} попыток: {e}")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"  [retry] {what}: попытка {attempt} не удалась ({e}), "
+                  f"жду {delay}с и повторяю...")
+            time.sleep(delay)
+
+
 def open_ws(gc, title, cols):
-    ss = gc.open_by_key(SPREADSHEET_ID)
+    ss = with_retry(lambda: gc.open_by_key(SPREADSHEET_ID), what="открытие таблицы-сборщика")
     try:
         ws = ss.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=title, rows=2000, cols=len(cols))
-    vals = ws.get_all_values()
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа-сборщика")
     if not vals or vals[0][:len(cols)] != cols:
         ws.update([cols], 'A1')
         ws.freeze(rows=1)
     return ws
 
 def existing_ids(ws):
-    vals = ws.get_all_values()
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа-сборщика")
     if not vals:
         return set()
     return {row[0] for row in vals[1:] if row and row[0]}
@@ -338,12 +354,13 @@ def row_tg(v):
 
 def append_new(ws, rows):
     if rows:
-        ws.append_rows(rows, value_input_option='USER_ENTERED')
+        with_retry(lambda: ws.append_rows(rows, value_input_option='USER_ENTERED'),
+                   what="запись новых строк в сборщик")
     return len(rows)
 
 def _parse_pub_date(s):
-    """Парсит дату из колонки 'Опубликовано'. Поддерживает '2026-08-12',
-    '2026-08-12 00:00:00' и datetime. Не распознал -> None (строку не трогаем)."""
+    """Парсит дату из 'Опубликовано'. '2026-08-12', '2026-08-12 00:00:00', datetime.
+    Не распознал -> None (строку не трогаем)."""
     if not s:
         return None
     if isinstance(s, dt.datetime):
@@ -356,7 +373,6 @@ def _parse_pub_date(s):
             return dt.datetime.strptime(txt[:len(fmt)+2], fmt).date()
         except ValueError:
             continue
-    # ISO-подобное начало 'YYYY-MM-DD...'
     m = re.match(r'(\d{4})-(\d{2})-(\d{2})', txt)
     if m:
         try:
@@ -368,8 +384,7 @@ def _parse_pub_date(s):
 
 def cleanup_source(ws, cols):
     """Удаляет из листа-сборщика строки старше SOURCE_MAX_AGE_DAYS по 'Опубликовано'.
-    Нераспознанная дата -> строку НЕ трогаем (безопасность превыше уборки).
-    Никогда не роняет прогон: любые ошибки только логируются."""
+    Нераспознанная дата -> НЕ трогаем. Никогда не роняет прогон."""
     if not SOURCE_MAX_AGE_DAYS:
         return
     try:
@@ -377,7 +392,7 @@ def cleanup_source(ws, cols):
     except ValueError:
         return
     try:
-        vals = ws.get_all_values()
+        vals = with_retry(lambda: ws.get_all_values(), what="чтение сырья перед подчисткой")
     except Exception as e:
         print(f'  [подчистка сырья] чтение не удалось: {e}')
         return
