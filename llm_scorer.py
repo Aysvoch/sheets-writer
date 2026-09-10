@@ -47,6 +47,7 @@ TRACKER_SPREADSHEET_ID = os.getenv('TRACKER_SPREADSHEET_ID', '')  # "Табли�
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '')
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', '')
+SUBSCRIBERS_API_SECRET = os.getenv('SUBSCRIBERS_API_SECRET', '')  # часть Б - рассылка аудитории
 
 # ==========================================================================
 # ПЕРЕКЛЮЧАТЕЛЬ МОДЕЛИ  (раскомментируй нужную строку)
@@ -77,6 +78,45 @@ NOTIFY_DETAIL_SCORE = 5   # >= этого идёт в бот (в таблицу 
 # Страховочный потолок листа "Вакансии": если после подчистки старья строк
 # всё ещё больше - обрезаем лишние снизу (см. cleanup_old_rows).
 MAX_ROWS = 150
+
+# ==========================================================================
+# ЧАСТЬ Б - рассылка аудитории через телеграм-бот (воркер Cloudflare)
+# ==========================================================================
+# Не секрет - публичный URL воркера, как и остальные API-адреса в этом файле.
+AUDIENCE_WORKER_URL = 'https://audience-bot.vakansiya-podehala.workers.dev'
+
+# Столько же вакансий в рассылку, сколько Андрею (notify_top[:10]) - паритет,
+# не простыня. Остальные кандидаты просто остаются непомеченными в журнале
+# «Аудитория» и уйдут следующим прогоном - бэклог не теряется, просто не спешит.
+AUDIENCE_BATCH_CAP = 10
+
+# Запас от лимита Telegram (4096) под шапку и погрешность - при этой длине режем
+# накопленный текст на отдельное сообщение, не разрывая вакансию посередине строки.
+AUDIENCE_MSG_BUDGET = 3800
+
+AUDIENCE_LOG_SHEET = 'Аудитория'              # служебный лист-журнал В СБОРЩИКЕ
+AUDIENCE_LOG_COLUMNS = ['source_id', 'sent_at']
+
+# Порог подчистки журнала - ЗАВЕДОМО больше MAX_AGE_DAYS, не впритык. Причина:
+# запись здесь снята по sent_at (когда разослали), а сама вакансия в листе
+# «Вакансии» снимается cleanup_old_rows по published (когда опубликована) -
+# это разные даты, published <= sent_at (рассылаем не раньше публикации, часто
+# позже - пока соберём, оценим). Если чистить журнал впритык к MAX_AGE_DAYS,
+# при любой рассинхронизации (задержка сборщика, ручной перезапуск, кривая дата)
+# можно снести запись о вакансии, которая в «Вакансии» ещё жива - already_sent_ids
+# её не увидит, build_audience_candidates сочтёт новой, и она уйдёт подписчикам
+# повторно. +7 дней - запас с большим отрывом от типичной задержки публикация->
+# рассылка (обычно часы-сутки, не неделя), не тесно подобранное число.
+AUDIENCE_LOG_MAX_AGE_DAYS = MAX_AGE_DAYS + 7
+
+AUDIENCE_SEND_PAUSE = 0.05       # пауза между получателями - лимит Телеграма ~30/сек
+AUDIENCE_SEND_RETRIES = 3        # сеть/5xx - столько попыток, потом пропуск получателя
+AUDIENCE_SEND_RETRY_DELAYS = [2, 4]
+AUDIENCE_RATE_LIMIT_RETRIES = 5  # 429 - ждём ровно retry_after, но не бесконечно
+
+# ДОЛЖНО совпадать с MAX_REMOVE_PER_CALL в worker/src/config.js - воркер отвергнет
+# пачку крупнее этого потолка (400 Bad Request), а не молча обрежет её сам.
+WORKER_REMOVE_BATCH_CAP = 40
 
 _MONTHS = {'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6,
            'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12}
@@ -381,10 +421,16 @@ def gc_client():
             f"Проверь credentials.json и доступ к таблице."
         )
 
-def read_raw(gc):
-    """Читает обе вкладки сырья, возвращает список (source_id, текст_для_LLM, дата, ссылка)."""
-    ss = with_retry(lambda: gc.open_by_key(RAW_SPREADSHEET_ID),
-                    what="открытие таблицы-сборщика")
+def open_raw(gc):
+    """Открывает таблицу-сборщик. Отдельно от read_raw, чтобы то же соединение
+    переиспользовать для журнала рассылки аудитории (notify_audience) - без
+    второго open_by_key на ту же таблицу в том же прогоне."""
+    return with_retry(lambda: gc.open_by_key(RAW_SPREADSHEET_ID),
+                      what="открытие таблицы-сборщика")
+
+def read_raw(ss):
+    """Читает обе вкладки сырья из уже открытой таблицы-сборщика (см. open_raw),
+    возвращает список (source_id, текст_для_LLM, дата, ссылка)."""
     items = []
     for name in RAW_SHEETS:
         try:
@@ -429,6 +475,74 @@ def open_out(gc):
 def existing_ids(ws):
     vals = with_retry(lambda: ws.get_all_values(), what="чтение существующих ID")
     return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
+
+# ==========================================================================
+# Журнал рассылки аудитории (часть Б) - служебная механика, не то, на что
+# смотрят глазами, поэтому живёт в таблице-сборщике, а не в Таблице неудач.
+# Дедуп по source_id (одна лента на всех - персонализации под подписчика нет),
+# НЕ по паре подписчик+вакансия: так проще и не требует правок в KV воркера.
+# ==========================================================================
+def open_audience_log(ss):
+    """Открывает/создаёт лист 'Аудитория' в таблице-сборщике (ss - уже открытая
+    open_raw()). Схема отдельная от 'Вакансии' - никак не задевает её колонки/
+    форматирование."""
+    try:
+        ws = ss.worksheet(AUDIENCE_LOG_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=AUDIENCE_LOG_SHEET, rows=1000, cols=len(AUDIENCE_LOG_COLUMNS))
+        with_retry(lambda: ws.update([AUDIENCE_LOG_COLUMNS], 'A1'),
+                  what="запись заголовка «Аудитория»")
+    return ws
+
+def already_sent_ids(ws):
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение журнала «Аудитория»")
+    return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
+
+def append_sent(ws, source_ids):
+    # append_rows (серверный авто-детект диапазона) safe ТОЛЬКО пока в этом
+    # листе нет скрытых колонок. В листе «Вакансии» ровно из-за скрытой колонки A
+    # (source_id, hiddenByUser) авто-детект пропускал её и писал строки со сдвигом
+    # на +1, молча ломая дедуп по колонке A (см. build_row/target_range выше -
+    # там из-за этого записываем явным A{n}:O{n}, а не append_row). Если когда-нибудь
+    # здесь тоже спрячут колонку - повторится тот же баг. Прячете колонку - переходите
+    # на явный target_range, как в build_row, а не append_rows.
+    if not source_ids:
+        return
+    now_iso = dt.datetime.now().isoformat(timespec='seconds')
+    rows = [[sid, now_iso] for sid in source_ids]
+    with_retry(lambda: ws.append_rows(rows, value_input_option='RAW'),
+              what="запись в журнал «Аудитория»")
+
+def cleanup_audience_log(ws):
+    """Чистит лист 'Аудитория' от записей старше AUDIENCE_LOG_MAX_AGE_DAYS (по
+    sent_at). По образцу cleanup_old_rows: собрать индексы старых строк, снести
+    пачкой deleteDimension. Нераспознанная дата -> НЕ удаляем (лучше лишняя
+    строка, чем потерянный дедуп - симметрично too_old())."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение журнала «Аудитория» перед подчисткой")
+    if len(vals) <= 1:
+        return
+    cutoff = dt.date.today() - dt.timedelta(days=AUDIENCE_LOG_MAX_AGE_DAYS)
+    to_delete = []
+    for i, row in enumerate(vals[1:], start=2):
+        raw = row[1] if len(row) > 1 else ''
+        try:
+            sent_date = dt.datetime.fromisoformat(raw).date()
+        except ValueError:
+            continue
+        if sent_date < cutoff:
+            to_delete.append(i)
+    if not to_delete:
+        return
+    sid = ws.id
+    reqs = [{'deleteDimension': {
+        'range': {'sheetId': sid, 'dimension': 'ROWS',
+                  'startIndex': rownum - 1, 'endIndex': rownum}}}
+            for rownum in sorted(to_delete, reverse=True)]
+    try:
+        ws.spreadsheet.batch_update({'requests': reqs})
+        print(f'  [аудитория] журнал: удалено старых записей (>{AUDIENCE_LOG_MAX_AGE_DAYS}д): {len(to_delete)}')
+    except Exception as e:
+        print(f'  [аудитория] журнал: не удалось подчистить: {e}')
 
 def build_row(item, data):
     def g(key, default='не указано'):
@@ -657,6 +771,16 @@ def cleanup_old_rows(ws):
 # ==========================================================================
 # Телеграм-счётчик
 # ==========================================================================
+# ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (не баг, не чинить вслепую): notify_count зовётся ОДИН
+# раз, после того как весь цикл по todo в main() уже отработал, а запись строки
+# в лист происходит раньше, чем пополнение notify_top. Если процесс упадёт
+# посередине цикла - часть вакансий уже физически в листе (и больше никогда не
+# попадёт в todo/notify_top на будущих прогонах), но notify_count для них в
+# этом прогоне не вызывался -> личное уведомление по ним теряется навсегда,
+# сама вакансия в листе остаётся видна. Сценарий редкий, осознанно не лечим:
+# таблица - основной канал, уведомление - удобство, а лечение требует переделки
+# уже работающего кода. У рассылки аудитории (notify_audience) от этого же
+# сценария есть защита - персистентный журнал «Аудитория», это разные механизмы.
 def notify_count(n, top=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
@@ -683,6 +807,209 @@ def notify_count(n, top=None):
         print(f'  [телеграм] не отправлено: {e}')
 
 # ==========================================================================
+# Часть Б - рассылка аудитории (подписчики бота, список берём у воркера)
+# ==========================================================================
+def build_audience_candidates(ws, already_sent):
+    """Читает лист 'Вакансии' целиком, возвращает кандидатов на рассылку:
+    score >= NOTIFY_DETAIL_SCORE, ещё не в журнале, не старше MAX_AGE_DAYS.
+    Читает ВЕСЬ лист (не только сегодняшнее добавленное) - так подхватывается
+    и бэклог с прошлого упавшего/пропущенного прогона, не только новое."""
+    rows = with_retry(lambda: ws.get_all_records(), what="чтение листа «Вакансии» для аудитории")
+    candidates = []
+    for row in rows:
+        sid = str(row.get('source_id', '')).strip()
+        if not sid or sid in already_sent:
+            continue
+        if too_old(row.get('Опубликовано', '')):
+            continue
+        try:
+            score = float(row.get('Оценка'))
+        except (TypeError, ValueError):
+            continue
+        if score < NOTIFY_DETAIL_SCORE:
+            continue
+        candidates.append({
+            'source_id': sid,
+            'company': str(row.get('Компания') or ''),
+            'title': str(row.get('Должность') or 'вакансия'),
+            'format': str(row.get('Формат') or ''),
+            'location': str(row.get('Локация') or ''),
+            'url': str(row.get('Ссылка') or ''),
+            'score': score,
+        })
+    candidates.sort(key=lambda v: v['score'], reverse=True)
+    return candidates
+
+def audience_vacancy_line(v):
+    title = v['title'] if len(v['title']) <= 40 else v['title'][:40].rstrip() + '…'
+    parts = [p for p in (v['company'], v['format'], v['location'])
+             if p and p != 'не указано']
+    tail = ' · '.join(parts)
+    link = f'<a href=\"{html.escape(v["url"], quote=True)}\">{html.escape(title)}</a>'
+    return f'• {link}' + (f' · {html.escape(tail)}' if tail else '')
+
+def build_audience_messages(candidates):
+    """Список вакансий -> список текстов сообщений, каждый <= AUDIENCE_MSG_BUDGET
+    символов. Режем по границам вакансий, не разрывая строку посередине."""
+    header = f'🎯 Вакансии product manager: {len(candidates)}'
+    lines = [header] + [audience_vacancy_line(v) for v in candidates]
+    messages, current, current_len = [], [], 0
+    for line in lines:
+        piece_len = len(line) + (1 if current else 0)   # +1 за '\n', если не первая в чанке
+        if current and current_len + piece_len > AUDIENCE_MSG_BUDGET:
+            messages.append('\n'.join(current))
+            current, current_len, piece_len = [], 0, len(line)
+        current.append(line)
+        current_len += piece_len
+    if current:
+        messages.append('\n'.join(current))
+    return messages
+
+def fetch_active_subscribers():
+    """GET /subscribers у воркера. None - не удалось получить список (сеть,
+    неверный секрет и т.п.), рассылку в этот раз лучше не делать вовсе, чем
+    разослать пустоте или упасть посередине."""
+    url = f'{AUDIENCE_WORKER_URL}/subscribers'
+    headers = {'X-Subscribers-Secret': SUBSCRIBERS_API_SECRET}
+    def call():
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    try:
+        data = with_retry(call, what="список подписчиков (воркер)")
+    except Exception as e:
+        print(f'  [аудитория] не удалось получить список подписчиков: {e}')
+        return None
+    ids = data.get('user_ids') if isinstance(data, dict) else None
+    if not isinstance(ids, list):
+        print('  [аудитория] неожиданный формат ответа воркера')
+        return None
+    return [str(i) for i in ids]
+
+def report_blocked_subscribers(chat_ids):
+    """Лучшее усилие: сообщает воркеру, кого можно вычистить из KV (403/chat not
+    found при реальной отправке). Не критично для уже состоявшейся рассылки -
+    без with_retry: если не получилось, воркер продолжит натыкаться на тот же
+    403 у тех же адресатов и в следующий раз, ничего не теряется, просто отложится.
+    Пачками по WORKER_REMOVE_BATCH_CAP - ровно потолок, который держит воркер."""
+    if not chat_ids:
+        return
+    url = f'{AUDIENCE_WORKER_URL}/subscribers/remove'
+    headers = {'X-Subscribers-Secret': SUBSCRIBERS_API_SECRET, 'Content-Type': 'application/json'}
+    for i in range(0, len(chat_ids), WORKER_REMOVE_BATCH_CAP):
+        batch = chat_ids[i:i + WORKER_REMOVE_BATCH_CAP]
+        try:
+            r = requests.post(url, headers=headers, json={'user_ids': batch}, timeout=30)
+            if r.status_code == 200:
+                removed = (r.json() or {}).get('removed', '?')
+                print(f'  [аудитория] воркер вычистил заблокировавших: {removed}')
+            else:
+                print(f'  [аудитория] воркер отказал в чистке заблокировавших ({r.status_code})')
+        except Exception as e:
+            print(f'  [аудитория] не удалось сообщить воркеру о блокировках: {e}')
+
+def send_audience_message(chat_id, text):
+    """Отправляет один текст одному получателю.
+    'ok' - доставлено; 'blocked' - 403 или 400 chat not found (заблокировал бота/
+    удалил аккаунт - подписчика надо чистить); 'failed' - сеть/5xx/прочее после
+    всех попыток, этого получателя просто пропускаем в этот раз."""
+    network_attempts = 0
+    rate_limit_attempts = 0
+    while True:
+        try:
+            r = requests.post(
+                f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage',
+                json={'chat_id': chat_id, 'text': text,
+                      'parse_mode': 'HTML', 'disable_web_page_preview': True},
+                timeout=30)
+        except requests.exceptions.RequestException:
+            network_attempts += 1
+            if network_attempts > AUDIENCE_SEND_RETRIES:
+                return 'failed'
+            time.sleep(AUDIENCE_SEND_RETRY_DELAYS[min(network_attempts, len(AUDIENCE_SEND_RETRY_DELAYS)) - 1])
+            continue
+
+        if r.status_code == 200:
+            return 'ok'
+        if r.status_code == 403:
+            return 'blocked'
+        if r.status_code == 400:
+            desc = ''
+            try:
+                desc = (r.json() or {}).get('description', '')
+            except ValueError:
+                pass
+            return 'blocked' if 'chat not found' in desc.lower() else 'failed'
+        if r.status_code == 429:
+            rate_limit_attempts += 1
+            if rate_limit_attempts > AUDIENCE_RATE_LIMIT_RETRIES:
+                return 'failed'
+            retry_after = 1
+            try:
+                retry_after = (r.json() or {}).get('parameters', {}).get('retry_after', 1)
+            except ValueError:
+                pass
+            time.sleep(retry_after)
+            continue
+        # 5xx и прочее неучтённое - тот же путь, что сеть: ретрай с паузой
+        network_attempts += 1
+        if network_attempts > AUDIENCE_SEND_RETRIES:
+            return 'failed'
+        time.sleep(AUDIENCE_SEND_RETRY_DELAYS[min(network_attempts, len(AUDIENCE_SEND_RETRY_DELAYS)) - 1])
+
+def notify_audience(gc, ss_raw, ws_vacancies):
+    """Рассылка той же ленты подписчикам бота. Падение здесь НЕ должно ронять
+    остальной пайплайн (лист уже записан, Андрею уже отправлено) - поэтому вся
+    функция под одним try в вызывающем коде, а не только отдельные отправки."""
+    if not SUBSCRIBERS_API_SECRET:
+        return   # часть Б не настроена (секрет ещё не залит) - тихо пропускаем
+
+    ws_log = open_audience_log(ss_raw)
+    cleanup_audience_log(ws_log)
+    sent_ids = already_sent_ids(ws_log)
+    candidates = build_audience_candidates(ws_vacancies, sent_ids)[:AUDIENCE_BATCH_CAP]
+    if not candidates:
+        return
+
+    subscribers = fetch_active_subscribers()
+    if subscribers is None:
+        print('  [аудитория] откладываю рассылку - список подписчиков недоступен')
+        return
+
+    messages = build_audience_messages(candidates)
+    blocked, sent_count = [], 0
+    for chat_id in subscribers:
+        ok = True
+        for text in messages:
+            status = send_audience_message(chat_id, text)
+            if status == 'blocked':
+                blocked.append(chat_id)
+                ok = False
+                break
+            if status == 'failed':
+                ok = False
+                break
+            time.sleep(AUDIENCE_SEND_PAUSE)
+        if ok:
+            sent_count += 1
+
+    print(f'  [аудитория] разослано {sent_count}/{len(subscribers)} подписчикам, '
+          f'вакансий в пачке: {len(candidates)}')
+
+    # Пометить как отправленное можно, только если пачка реально до кого-то дошла,
+    # либо подписчиков просто не было (рассылать некому - пачка тоже "выполнена").
+    # Если подписчики БЫЛИ, а дошло до 0 - похоже на системный сбой (не тот
+    # BOT_TOKEN и т.п.): лучше повторить всю пачку следующим прогоном, чем
+    # тихо списать вакансию в архив, до которой реально никто не дошёл.
+    if subscribers and sent_count == 0:
+        print('  [аудитория] ни один получатель не подтверждён - не помечаю как отправленное, повтор в следующий прогон')
+    else:
+        append_sent(ws_log, [c['source_id'] for c in candidates])
+
+    if blocked:
+        report_blocked_subscribers(blocked)
+
+# ==========================================================================
 # MAIN
 # ==========================================================================
 def main():
@@ -694,7 +1021,8 @@ def main():
 
     gc = gc_client()
     print('Читаю сырьё...')
-    items = read_raw(gc)
+    ss_raw = open_raw(gc)
+    items = read_raw(ss_raw)
     ws = open_out(gc)
     have = existing_ids(ws)
     todo = [it for it in items
@@ -773,6 +1101,10 @@ def main():
 
     notify_top.sort(key=lambda v: v['score'], reverse=True)
     notify_count(added, notify_top[:10])
+    try:
+        notify_audience(gc, ss_raw, ws)
+    except Exception as e:
+        print(f'  [аудитория] рассылка не выполнена: {e}')
     cleanup_old_rows(ws)
     total_rows = len(with_retry(lambda: ws.get_all_values(), what="чтение листа перед оформлением"))
     style_sheet(ws, total_rows)

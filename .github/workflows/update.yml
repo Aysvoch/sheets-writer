@@ -2,9 +2,8 @@ name: vacancy-pipeline
 
 on:
   schedule:
-    - cron: '17 3 * * *'    # ~06:17 Мск, утро
-    - cron: '17 11 * * *'   # ~14:17 Мск, день (запасной)
-    - cron: '17 15 * * *'   # ~18:17 Мск, вечер
+    - cron: '17 3 * * *'    # ~06:17 Мск, основной
+    - cron: '17 8 * * *'    # ~11:17 Мск, страховочный - догоняет пропуски, не вторая рассылка
   workflow_dispatch:
 
 jobs:
@@ -30,3 +29,4 @@ jobs:
           CREDENTIALS_FILE: credentials.json
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SUBSCRIBERS_API_SECRET: ${{ secrets.SUBSCRIBERS_API_SECRET }}

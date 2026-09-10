@@ -1,5 +1,5 @@
 import { handleWebhookUpdate } from './webhook.js';
-import { handleSubscribersRequest } from './subscribers.js';
+import { handleSubscribersRequest, handleRemoveSubscribersRequest } from './subscribers.js';
 import { timingSafeEqual } from './security.js';
 import { logError, sendTestAlert } from './alerts.js';
 
@@ -56,6 +56,10 @@ export default {
 
     if (url.pathname === '/subscribers' && request.method === 'GET') {
       return handleSubscribersRequest(request, env, ctx);
+    }
+
+    if (url.pathname === '/subscribers/remove' && request.method === 'POST') {
+      return handleRemoveSubscribersRequest(request, env, ctx);
     }
 
     if (url.pathname === '/test-alert' && request.method === 'GET') {

@@ -1,6 +1,6 @@
 import { timingSafeEqual } from './security.js';
 import { getChatMember } from './telegram.js';
-import { getUser, putUser, userIdFromKey } from './state.js';
+import { getUser, putUser, deleteUser, userIdFromKey } from './state.js';
 import { notifyRevoked } from './revoke.js';
 import {
   CHANNEL_USERNAME,
@@ -8,6 +8,7 @@ import {
   RECHECK_THRESHOLD_MS,
   MAX_RECHECKS_PER_CALL,
   SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS,
+  MAX_REMOVE_PER_CALL,
 } from './config.js';
 import { logError } from './alerts.js';
 
@@ -154,4 +155,68 @@ export async function handleSubscribersRequest(request, env, ctx) {
     await logError(env, ctx, 'subscribers_endpoint_failed', err);
     return new Response('Internal Error', { status: 500 });
   }
+}
+
+// Не доверяем структуре тела: user_ids должен быть массивом, элементы -
+// строка/число, приводимые к telegram user_id (положительное целое). Всё
+// остальное молча отбрасываем, а не роняем весь запрос из-за одного мусорного
+// элемента. Дедуп через Set - если id повторили в массиве, удаляем один раз.
+function extractValidIds(userIds) {
+  const ids = new Set();
+  for (const raw of userIds) {
+    if (typeof raw !== 'string' && typeof raw !== 'number') continue;
+    const id = String(raw).trim();
+    if (!/^\d+$/.test(id)) continue;
+    ids.add(id);
+  }
+  return [...ids];
+}
+
+// Разрушающий эндпоинт (удаляет записи из KV насовсем) - в отличие от /subscribers
+// и /test-alert, которые только читают/шлют. Тот же секрет и константное сравнение,
+// но дополнительно: строгая валидация тела и жёсткий потолок id за вызов - чтобы
+// один вызов (баг на стороне Python, утечка секрета) не мог вычистить всю базу разом.
+export async function handleRemoveSubscribersRequest(request, env, ctx) {
+  const secretHeader = request.headers.get('x-subscribers-secret') || '';
+  if (!env.SUBSCRIBERS_API_SECRET || !timingSafeEqual(secretHeader, env.SUBSCRIBERS_API_SECRET)) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return new Response('Bad Request: invalid JSON', { status: 400 });
+  }
+
+  if (!body || !Array.isArray(body.user_ids)) {
+    return new Response('Bad Request: user_ids must be an array', { status: 400 });
+  }
+
+  const ids = extractValidIds(body.user_ids);
+  if (ids.length > MAX_REMOVE_PER_CALL) {
+    return new Response(
+      JSON.stringify({ error: `too many ids in one call (max ${MAX_REMOVE_PER_CALL})` }),
+      { status: 400, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
+  let removed = 0;
+  for (const id of ids) {
+    try {
+      await deleteUser(env.AUDIENCE_KV, id);
+      removed++;
+    } catch (err) {
+      await logError(env, ctx, 'remove_subscriber_failed', err);
+    }
+  }
+
+  // Видимость массовой чистки в логах - отдельно от обычного шума.
+  if (removed > 0) {
+    console.error(`[audience-bot] subscribers_removed: ${removed}`);
+  }
+
+  return new Response(JSON.stringify({ removed }), {
+    headers: { 'content-type': 'application/json' },
+  });
 }
