@@ -2,8 +2,9 @@ name: vacancy-pipeline
 
 on:
   schedule:
-    - cron: '0 3 * * *'
-    - cron: '0 15 * * *'
+    - cron: '17 3 * * *'    # ~06:17 Мск, утро
+    - cron: '17 11 * * *'   # ~14:17 Мск, день (запасной)
+    - cron: '17 15 * * *'   # ~18:17 Мск, вечер
   workflow_dispatch:
 
 jobs:
