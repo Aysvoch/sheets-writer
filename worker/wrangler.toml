@@ -1,0 +1,12 @@
+name = "audience-bot"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# id заполняется после создания namespace командой:
+#   wrangler kv namespace create AUDIENCE_KV
+kv_namespaces = [
+  { binding = "AUDIENCE_KV", id = "REPLACE_WITH_KV_NAMESPACE_ID" }
+]
+
+# Секреты (BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, SUBSCRIBERS_API_SECRET, OWNER_CHAT_ID)
+# сюда НЕ идут - только через `wrangler secret put`.

@@ -5,3 +5,9 @@ credentials.json
 __pycache__/
 *.pyc
 run.log
+
+# воркер аудитории (Cloudflare Workers) - точечные исключения из *.json выше
+!worker/package.json
+!worker/package-lock.json
+worker/.dev.vars
+worker/node_modules/
