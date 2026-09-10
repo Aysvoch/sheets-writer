@@ -14,16 +14,24 @@ import { logError } from './alerts.js';
 const RATE_LIMIT_KEY = 'ratelimit:subscribers';
 const LAST_ACTIVE_COUNT_KEY = 'stats:active_count';
 
-async function isRateLimited(kv) {
-  const last = await kv.get(RATE_LIMIT_KEY);
-  const now = Date.now();
-  if (last && now - Number(last) < SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS * 1000) {
-    return true;
+// Служебная проверка - вторична по отношению к самой рассылке. Если сама
+// сломалась, не блокируем часть Б лишний раз - лучше изредка пропустить лимит
+// частоты, чем оставить рассылку без списка подписчиков из-за сбоя в бухгалтерии.
+async function isRateLimited(kv, env, ctx) {
+  try {
+    const last = await kv.get(RATE_LIMIT_KEY);
+    const now = Date.now();
+    if (last && now - Number(last) < SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS * 1000) {
+      return true;
+    }
+    await kv.put(RATE_LIMIT_KEY, String(now), {
+      expirationTtl: SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS,
+    });
+    return false;
+  } catch (err) {
+    await logError(env, ctx, 'ratelimit_check_failed', err);
+    return false;
   }
-  await kv.put(RATE_LIMIT_KEY, String(now), {
-    expirationTtl: SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS,
-  });
-  return false;
 }
 
 // Активных подписчиков и их last_checked_at берём из metadata, которую kv.list()
@@ -111,7 +119,7 @@ export async function handleSubscribersRequest(request, env, ctx) {
     return new Response('Unauthorized', { status: 401 });
   }
 
-  if (await isRateLimited(env.AUDIENCE_KV)) {
+  if (await isRateLimited(env.AUDIENCE_KV, env, ctx)) {
     return new Response('Too Many Requests', { status: 429 });
   }
 

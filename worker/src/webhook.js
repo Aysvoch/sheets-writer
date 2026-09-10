@@ -75,7 +75,7 @@ export async function handleWebhookUpdate(update, env, ctx) {
   // за каждое сообщение ещё до того, как мы решим, что это спам.
   if (message && message.from && typeof message.from.id !== 'undefined' && !message.from.is_bot) {
     const userId = String(message.from.id);
-    const flood = await checkMessageFlood(env.AUDIENCE_KV, userId);
+    const flood = await checkMessageFlood(env.AUDIENCE_KV, userId, env, ctx);
     if (flood.limited) {
       if (flood.justEntered) {
         try {
@@ -88,7 +88,7 @@ export async function handleWebhookUpdate(update, env, ctx) {
     }
   }
 
-  if (await isDuplicateUpdate(env.AUDIENCE_KV, update.update_id)) return;
+  if (await isDuplicateUpdate(env.AUDIENCE_KV, update.update_id, env, ctx)) return;
 
   if (update.message) {
     await handleMessageUpdate(update.message, env, ctx);

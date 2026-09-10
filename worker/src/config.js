@@ -24,10 +24,21 @@ export const UPDATE_DEDUP_TTL_SECONDS = 24 * 60 * 60;
 // Уровень 2 - если всплеск превышен, один раз предупреждаем и включаем
 // FLOOD_COOLDOWN_SECONDS, на время которого сообщения дропаются без единой
 // записи в KV (кроме той самой одной, что ставит cooldown-ключ).
-export const BURST_WINDOW_SECONDS = 15;
+//
+// BURST_WINDOW_SECONDS = 60, а не 15 - Cloudflare KV не принимает expirationTtl
+// короче 60 секунд (кладёт запись с TTL, а не сам факт "было сообщение"; более
+// короткое окно физически нельзя выразить этим ключом). На смысл лимита это не
+// давит: 5 сообщений за 60 секунд - тот же бытовой сценарий (человек успевает
+// набрать пару команд за минуту куда легче, чем за 15 секунд), а для спамера
+// это строже прежнего - разрешённая скорость до cooldown ниже (5/60с вместо 5/15с).
+export const BURST_WINDOW_SECONDS = 60;
 export const BURST_MAX_MESSAGES = 5;
 export const FLOOD_COOLDOWN_SECONDS = 5 * 60;
 
 export const ALERT_THROTTLE_SECONDS = 60 * 60;
 
-export const SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS = 30;
+// Cloudflare KV: минимальный expirationTtl - 60 секунд, поэтому это и есть
+// потолок частоты - 30, как было раньше, KV бы просто отверг. На смысл не влияет:
+// часть Б дёргает эндпоинт пару раз в сутки с интервалом в часы, 60 секунд
+// как защитный порог от злоупотребления ничем не хуже 30.
+export const SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS = 60;

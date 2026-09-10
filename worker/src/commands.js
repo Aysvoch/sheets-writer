@@ -9,6 +9,7 @@ import {
   HELP_TEXT,
   UNKNOWN_TEXT,
   CHECK_FAILED_TEXT,
+  STORAGE_FAILED_TEXT,
 } from './texts.js';
 import { logError } from './alerts.js';
 
@@ -39,30 +40,44 @@ async function handleStart(userId, chatId, env, ctx) {
     return;
   }
 
-  const existing = await getUser(env.AUDIENCE_KV, userId);
   const now = Date.now();
+  try {
+    const existing = await getUser(env.AUDIENCE_KV, userId);
 
-  if (existing && existing.state === 'active') {
-    await sendMessage(env.BOT_TOKEN, chatId, ALREADY_ACTIVE_TEXT);
+    if (existing && existing.state === 'active') {
+      await sendMessage(env.BOT_TOKEN, chatId, ALREADY_ACTIVE_TEXT);
+      return;
+    }
+
+    if (existing) {
+      existing.state = 'active';
+      existing.last_checked_at = now;
+      await putUser(env.AUDIENCE_KV, userId, existing);
+    } else {
+      await putUser(env.AUDIENCE_KV, userId, newUser(now));
+    }
+  } catch (err) {
+    // Подписку подтвердили, но сохранить состояние не смогли - пользователь
+    // должен узнать об этом, а не решить, что бот молчит просто так.
+    await logError(env, ctx, 'save_state_failed', err);
+    await sendMessage(env.BOT_TOKEN, chatId, STORAGE_FAILED_TEXT);
     return;
-  }
-
-  if (existing) {
-    existing.state = 'active';
-    existing.last_checked_at = now;
-    await putUser(env.AUDIENCE_KV, userId, existing);
-  } else {
-    await putUser(env.AUDIENCE_KV, userId, newUser(now));
   }
 
   await sendMessage(env.BOT_TOKEN, chatId, WELCOME_TEXT);
 }
 
-async function handleStop(userId, chatId, env) {
-  const existing = await getUser(env.AUDIENCE_KV, userId);
-  if (existing && existing.state !== 'stopped') {
-    existing.state = 'stopped';
-    await putUser(env.AUDIENCE_KV, userId, existing);
+async function handleStop(userId, chatId, env, ctx) {
+  try {
+    const existing = await getUser(env.AUDIENCE_KV, userId);
+    if (existing && existing.state !== 'stopped') {
+      existing.state = 'stopped';
+      await putUser(env.AUDIENCE_KV, userId, existing);
+    }
+  } catch (err) {
+    await logError(env, ctx, 'save_state_failed', err);
+    await sendMessage(env.BOT_TOKEN, chatId, STORAGE_FAILED_TEXT);
+    return;
   }
   await sendMessage(env.BOT_TOKEN, chatId, STOPPED_TEXT);
 }
@@ -73,7 +88,7 @@ async function handleHelp(chatId, env) {
 
 export async function handleCommand(command, userId, chatId, env, ctx) {
   if (command === 'start') return handleStart(userId, chatId, env, ctx);
-  if (command === 'stop') return handleStop(userId, chatId, env);
+  if (command === 'stop') return handleStop(userId, chatId, env, ctx);
   if (command === 'help') return handleHelp(chatId, env);
 }
 

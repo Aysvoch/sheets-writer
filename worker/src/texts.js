@@ -32,4 +32,6 @@ export const CHECK_FAILED_TEXT = `⚠️ Не смог проверить дос
 
 export const FLOOD_WARNING_TEXT = `⏳ Слишком часто, подожди немного.`;
 
+export const STORAGE_FAILED_TEXT = `⚠️ Что-то сломалось, попробуй ещё раз через минуту.`;
+
 export const REVOKED_TEXT = `⏸️ Доступ к рассылке приостановлен. Вернуть - /start.`;
