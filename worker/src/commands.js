@@ -1,4 +1,4 @@
-import { getUser, putUser, newUser } from './state.js';
+import { getUser, putUser, newUser, incrementDeniedCount } from './state.js';
 import { getChatMember, sendMessage } from './telegram.js';
 import { CHANNEL_USERNAME, MEMBER_STATUSES } from './config.js';
 import {
@@ -36,6 +36,14 @@ async function handleStart(userId, chatId, env, ctx) {
 
   const isMember = MEMBER_STATUSES.has(check.status);
   if (!isMember) {
+    try {
+      await incrementDeniedCount(env.AUDIENCE_KV);
+    } catch (err) {
+      // Счётчик вторичен по отношению к самому отказу - сбой учёта не должен
+      // помешать ответить пользователю. Без owner-алерта: это метрика для
+      // просмотра, а не событие, требующее внимания на каждый отказ.
+      console.error(`[audience-bot] denied_count_failed: ${err && err.message}`);
+    }
     await sendMessage(env.BOT_TOKEN, chatId, ACCESS_DENIED_TEXT);
     return;
   }

@@ -1,6 +1,7 @@
 const USER_PREFIX = 'user:';
 const ACTIVE_COUNT_KEY = 'stats:active_count';
 const ACTIVE_COUNT_SNAPSHOT_KEY = 'stats:active_count_snapshot';
+const DENIED_COUNT_KEY = 'stats:denied_count';
 
 export function userKey(userId) {
   return `${USER_PREFIX}${userId}`;
@@ -92,4 +93,20 @@ export async function getActiveCountSnapshot(kv) {
 
 export async function setActiveCountSnapshot(kv, count) {
   await kv.put(ACTIVE_COUNT_SNAPSHOT_KEY, String(count));
+}
+
+// Счётчик отказов на гейте (ACCESS_DENIED_TEXT в handleStart) - метрика воронки:
+// сколько раз /start упёрся в требование подписки. Считает события, не людей -
+// без user_id (персональные данные не храним) и без дедупа, один и тот же человек,
+// нажавший /start трижды без подписки, даст +3. Только растёт, не сбрасывается.
+export async function getDeniedCount(kv) {
+  const raw = await kv.get(DENIED_COUNT_KEY);
+  return raw !== null ? parseInt(raw, 10) || 0 : 0;
+}
+
+export async function incrementDeniedCount(kv) {
+  const current = await getDeniedCount(kv);
+  const next = current + 1;
+  await kv.put(DENIED_COUNT_KEY, String(next));
+  return next;
 }

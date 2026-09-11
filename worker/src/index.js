@@ -2,6 +2,7 @@ import { handleWebhookUpdate } from './webhook.js';
 import { handleSubscribersRequest, handleRemoveSubscribersRequest } from './subscribers.js';
 import { timingSafeEqual } from './security.js';
 import { logError, sendTestAlert } from './alerts.js';
+import { getDeniedCount, getActiveCount } from './state.js';
 
 async function handleTelegramWebhook(request, env, ctx) {
   const secretHeader = request.headers.get('x-telegram-bot-api-secret-token') || '';
@@ -46,6 +47,30 @@ async function handleTestAlertRequest(request, env) {
   });
 }
 
+// Диагностика воронки: сколько раз показан отказ на гейте (не сбрасывается) и
+// сколько сейчас активных подписчиков - чтобы посмотреть цифры без захода в
+// дашборд Cloudflare. Секрет и заголовок те же, что у /subscribers и /test-alert -
+// тот же уровень доступа (владелец/CI), отдельный секрет не нужен.
+// Отдельный эндпоинт, а не поле в ответе /subscribers - тот уже впритык укладывается
+// в лимит подзапросов Cloudflare (см. бюджет в config.js), да и /subscribers - это
+// контракт рассылки части Б, мешать в него диагностику незачем. Всего 2 kv.get,
+// без rate-limit - как у /test-alert, дешёвое чтение под тем же секретом.
+async function handleStatsRequest(request, env) {
+  const secretHeader = request.headers.get('x-subscribers-secret') || '';
+  if (!env.SUBSCRIBERS_API_SECRET || !timingSafeEqual(secretHeader, env.SUBSCRIBERS_API_SECRET)) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  const [deniedCount, activeCount] = await Promise.all([
+    getDeniedCount(env.AUDIENCE_KV),
+    getActiveCount(env.AUDIENCE_KV),
+  ]);
+
+  return new Response(JSON.stringify({ denied_count: deniedCount, active_count: activeCount }), {
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -64,6 +89,10 @@ export default {
 
     if (url.pathname === '/test-alert' && request.method === 'GET') {
       return handleTestAlertRequest(request, env);
+    }
+
+    if (url.pathname === '/stats' && request.method === 'GET') {
+      return handleStatsRequest(request, env);
     }
 
     return new Response('Not Found', { status: 404 });
