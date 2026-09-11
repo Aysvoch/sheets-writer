@@ -3,6 +3,7 @@ import { checkMessageFlood } from './antiflood.js';
 import { handleCommand, handleUnknownText } from './commands.js';
 import { getUser, putUser } from './state.js';
 import { notifyRevoked } from './revoke.js';
+import { notifyLostAccess } from './alerts.js';
 import { sendMessage } from './telegram.js';
 import { FLOOD_WARNING_TEXT } from './texts.js';
 import { CHANNEL_USERNAME, MEMBER_STATUSES } from './config.js';
@@ -60,6 +61,7 @@ async function handleChatMemberUpdate(update, env, ctx) {
   await putUser(env.AUDIENCE_KV, userId, record);
 
   await notifyRevoked(env, ctx, userId);
+  await notifyLostAccess(env, ctx);
 }
 
 export async function handleWebhookUpdate(update, env, ctx) {

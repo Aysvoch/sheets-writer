@@ -11,7 +11,7 @@ import {
   CHECK_FAILED_TEXT,
   STORAGE_FAILED_TEXT,
 } from './texts.js';
-import { logError } from './alerts.js';
+import { logError, notifyNewSubscriber, notifyReactivated, notifyStopped } from './alerts.js';
 
 // Антифлуд на /start отдельно не нужен - общий гейт на все сообщения
 // (antiflood.js, включается до диспетчеризации команд в webhook.js) уже
@@ -53,8 +53,10 @@ async function handleStart(userId, chatId, env, ctx) {
       existing.state = 'active';
       existing.last_checked_at = now;
       await putUser(env.AUDIENCE_KV, userId, existing);
+      await notifyReactivated(env, ctx);
     } else {
       await putUser(env.AUDIENCE_KV, userId, newUser(now));
+      await notifyNewSubscriber(env, ctx);
     }
   } catch (err) {
     // Подписку подтвердили, но сохранить состояние не смогли - пользователь
@@ -71,8 +73,14 @@ async function handleStop(userId, chatId, env, ctx) {
   try {
     const existing = await getUser(env.AUDIENCE_KV, userId);
     if (existing && existing.state !== 'stopped') {
+      // Уведомляем и уменьшаем счётчик только при уходе из active - переход
+      // revoked -> stopped уже учтён (счётчик уменьшен раньше, при самом revoked).
+      const wasActive = existing.state === 'active';
       existing.state = 'stopped';
       await putUser(env.AUDIENCE_KV, userId, existing);
+      if (wasActive) {
+        await notifyStopped(env, ctx);
+      }
     }
   } catch (err) {
     await logError(env, ctx, 'save_state_failed', err);

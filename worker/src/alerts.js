@@ -1,5 +1,6 @@
 import { ALERT_THROTTLE_SECONDS } from './config.js';
 import { sendMessage } from './telegram.js';
+import { adjustActiveCount } from './state.js';
 
 async function isAlertThrottled(kv, code) {
   return !!(await kv.get(`alert:${code}`));
@@ -73,4 +74,74 @@ export async function logError(env, ctx, code, err) {
 // вызывающий (эндпоинт /test-alert) мог отдать результат отправки в ответе.
 export async function sendTestAlert(env) {
   return sendOwnerAlert(env, '🧪 Тестовый алерт воркера аудитории - если видишь это, доставка работает.');
+}
+
+// Уведомления о движении подписчиков - НЕ ошибки (в отличие от logError), поэтому
+// не пишут в console.error и не троттлятся: подписки не спам, а раз в час скрыл бы
+// ровно то, ради чего это уведомление существует. Без user_id и имён - только
+// счётчик активных (stats:active_count, см. state.js), он и полезнее события,
+// и не персональные данные. Не должны ломать основной сценарий - тот же fail-open,
+// что у logError: работа в фоне (ctx.waitUntil), любая ошибка отправки/подсчёта
+// гасится тут же, до вызывающего кода она никогда не долетает.
+async function notifySubscriberCountChange(env, ctx, delta, prefix) {
+  const run = async () => {
+    try {
+      const count = await adjustActiveCount(env.AUDIENCE_KV, delta);
+      await sendOwnerAlert(env, `${prefix} Всего: ${count}`);
+    } catch (err) {
+      console.error(`[audience-bot] subscriber_notify_failed: ${err && err.message}`);
+    }
+  };
+
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(run());
+  } else {
+    await run();
+  }
+}
+
+// Впервые прошёл /start и записан как active.
+export async function notifyNewSubscriber(env, ctx) {
+  await notifySubscriberCountChange(env, ctx, 1, '➕ Новый подписчик.');
+}
+
+// Был stopped/revoked, снова стал active через /start.
+export async function notifyReactivated(env, ctx) {
+  await notifySubscriberCountChange(env, ctx, 1, '🔄 Реактивация.');
+}
+
+// Был active, сам отправил /stop.
+export async function notifyStopped(env, ctx) {
+  await notifySubscriberCountChange(env, ctx, -1, '➖ Отписался.');
+}
+
+// Был active, вышел из канала - обнаружено одиночным событием chat_member.
+export async function notifyLostAccess(env, ctx) {
+  await notifySubscriberCountChange(env, ctx, -1, '➖ Потерял доступ.');
+}
+
+// Пакетный отзыв доступа догоняющей проверкой (/subscribers, recheckCandidates) -
+// одно сводное сообщение вместо N отдельных, иначе на партии до MAX_RECHECKS_PER_CALL
+// отозванных уведомления сами по себе пробили бы лимит в 50 подзапросов Cloudflare
+// (см. расчёт бюджета в config.js). Счётчик здесь - готовое activeIds.length от
+// вызывающей стороны (уже точно пересчитан по всей KV в рамках того же вызова), а
+// не adjustActiveCount: она и без того тут же перезапишет stats:active_count этим
+// же точным числом (checkSubscriberDropAlert) - завести второй писатель в тот же
+// ключ в рамках одного вызова значило бы гоняться с самим собой без всякой пользы.
+export async function notifyLostAccessBatch(env, ctx, revokedCount, activeCount) {
+  if (revokedCount <= 0) return;
+
+  const run = async () => {
+    try {
+      await sendOwnerAlert(env, `➖ Потеряли доступ: ${revokedCount}. Всего: ${activeCount}`);
+    } catch (err) {
+      console.error(`[audience-bot] subscriber_notify_failed: ${err && err.message}`);
+    }
+  };
+
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(run());
+  } else {
+    await run();
+  }
 }

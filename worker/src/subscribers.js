@@ -1,6 +1,14 @@
 import { timingSafeEqual } from './security.js';
 import { getChatMember } from './telegram.js';
-import { getUser, putUser, deleteUser, userIdFromKey } from './state.js';
+import {
+  getUser,
+  putUser,
+  deleteUser,
+  userIdFromKey,
+  setActiveCount,
+  getActiveCountSnapshot,
+  setActiveCountSnapshot,
+} from './state.js';
 import { notifyRevoked } from './revoke.js';
 import {
   CHANNEL_USERNAME,
@@ -10,10 +18,9 @@ import {
   SUBSCRIBERS_ENDPOINT_MIN_INTERVAL_SECONDS,
   MAX_REMOVE_PER_CALL,
 } from './config.js';
-import { logError } from './alerts.js';
+import { logError, notifyLostAccessBatch } from './alerts.js';
 
 const RATE_LIMIT_KEY = 'ratelimit:subscribers';
-const LAST_ACTIVE_COUNT_KEY = 'stats:active_count';
 
 // Служебная проверка - вторична по отношению к самой рассылке. Если сама
 // сломалась, не блокируем часть Б лишний раз - лучше изредка пропустить лимит
@@ -60,6 +67,7 @@ async function listActiveUsers(kv) {
 async function recheckCandidates(kv, env, ctx, candidates) {
   const now = Date.now();
   const stillActiveIds = [];
+  let revokedCount = 0;
 
   for (const { userId } of candidates) {
     let memberStatus = null;
@@ -95,23 +103,31 @@ async function recheckCandidates(kv, env, ctx, candidates) {
       record.last_checked_at = now;
       await putUser(kv, userId, record);
       await notifyRevoked(env, ctx, userId);
+      revokedCount++;
     }
   }
 
-  return stillActiveIds;
+  return { stillActiveIds, revokedCount };
 }
 
 // Алерт только на падение с ненулевого числа подписчиков до нуля - а не на
 // "подписчиков ноль вообще" (нормальное состояние прямо сейчас, KV пустой).
+// Сравнение идёт по snapshot-ключу (getActiveCountSnapshot/setActiveCountSnapshot),
+// а не по живому ACTIVE_COUNT_KEY - тот правится на каждом /start /stop /revoke
+// между вызовами /subscribers, и если сравнивать по нему, типичный сценарий
+// "последний подписчик сам отправил /stop" гасит алерт сам собой (см. state.js).
 async function checkSubscriberDropAlert(kv, env, ctx, currentCount) {
-  const raw = await kv.get(LAST_ACTIVE_COUNT_KEY);
-  const previousCount = raw !== null ? parseInt(raw, 10) || 0 : null;
+  const previousCount = await getActiveCountSnapshot(kv);
 
-  if (previousCount !== null && previousCount > 0 && currentCount === 0) {
+  if (previousCount > 0 && currentCount === 0) {
     await logError(env, ctx, 'no_active_subscribers', new Error(`active subscribers dropped from ${previousCount} to 0`));
   }
 
-  await kv.put(LAST_ACTIVE_COUNT_KEY, String(currentCount));
+  await setActiveCountSnapshot(kv, currentCount);
+
+  // Точный пересчёт по всей KV - самоисцеление живого счётчика (adjustActiveCount
+  // в alerts.js) от любого дрейфа, накопившегося между вызовами /subscribers.
+  await setActiveCount(kv, currentCount);
 }
 
 export async function handleSubscribersRequest(request, env, ctx) {
@@ -139,12 +155,18 @@ export async function handleSubscribersRequest(request, env, ctx) {
     const toRecheck = stale.slice(0, MAX_RECHECKS_PER_CALL);
     const deferred = stale.slice(MAX_RECHECKS_PER_CALL);
 
-    const rechecked = await recheckCandidates(env.AUDIENCE_KV, env, ctx, toRecheck);
+    const { stillActiveIds: rechecked, revokedCount } = await recheckCandidates(env.AUDIENCE_KV, env, ctx, toRecheck);
 
     const activeIds = fresh
       .map((u) => u.userId)
       .concat(deferred.map((u) => u.userId))
       .concat(rechecked);
+
+    // Одно сводное сообщение на партию, не по одному на кандидата - иначе на
+    // MAX_RECHECKS_PER_CALL отозванных разом уведомления сами пробили бы лимит
+    // подзапросов Cloudflare (см. бюджет в config.js). Счётчик - уже посчитанный
+    // ниже activeIds.length, без лишнего обращения к KV.
+    await notifyLostAccessBatch(env, ctx, revokedCount, activeIds.length);
 
     await checkSubscriberDropAlert(env.AUDIENCE_KV, env, ctx, activeIds.length);
 
