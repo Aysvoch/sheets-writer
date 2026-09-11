@@ -11,3 +11,6 @@ run.log
 !worker/package-lock.json
 worker/.dev.vars
 worker/node_modules/
+
+# ручная рассылка объявлений - текст личный, репозиторий публичный
+announcement.txt
