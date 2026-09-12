@@ -774,9 +774,16 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
             print(f'  [подчистка] не удалось удалить старые строки: {e}')
 
     vals = with_retry(lambda: ws.get_all_values(), what="чтение листа после подчистки старья")
-    n_data = len(vals) - 1
+    sid_idx = COLUMNS.index('source_id')
+    # ТОЛЬКО строки с непустым source_id - реальные данные. Лист растится
+    # заранее пачками по 200 (см. add_rows в main()), поэтому get_all_values()
+    # обычно возвращает и пустой хвост незаписанных строк грида - без этого
+    # фильтра n_data мерил бы высоту листа, а не число вакансий, и cap мог бы
+    # сработать вхолостую на пустоте, а не на реальном переполнении.
+    data_rows = [(i, row) for i, row in enumerate(vals[1:], start=2)
+                 if len(row) > sid_idx and row[sid_idx].strip()]
+    n_data = len(data_rows)
     if n_data > MAX_ROWS:
-        sid_idx = COLUMNS.index('source_id')
         seen_idx = COLUMNS.index('Просмотрено')
         score_idx = COLUMNS.index('Оценка')
 
@@ -787,8 +794,8 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
                 return None
 
         deletable = []   # (rownum, seen_bool, score_or_neg_inf) - только незащищённые
-        for i, row in enumerate(vals[1:], start=2):
-            sid_val = row[sid_idx] if len(row) > sid_idx else ''
+        for i, row in data_rows:
+            sid_val = row[sid_idx]
             score = parse_score(row)
             protected = score is not None and score >= NOTIFY_DETAIL_SCORE and sid_val not in delivered_ids
             if not protected:
