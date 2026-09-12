@@ -51,11 +51,13 @@ TG_CHAT_ID = os.getenv('TG_CHAT_ID', '')
 # НАСТРОЙКИ (не секреты) - меняй тут
 # ==========================================================================
 
-# --- Хабр: поисковые запросы (на двух языках) и города ---
+# --- Хабр: поисковые запросы (на двух языках) ---
+# Без фильтра по городам/remote: раньше искали только Казань+Москва+удалёнку,
+# но профиль давно "вся Россия + удалёнка" (см. промпт LLM звена 2) - фильтр
+# по локациям сужал выдачу в разы, а рассинхрон с профилем занижал сбор.
+# Географию теперь отсеивает LLM, как и раньше делала для Телеграма.
 HABR_QUERIES = ['product manager', 'product owner', 'менеджер продукта',
                 'продакт', 'delivery manager', 'проджект']
-HABR_LOCATIONS = ['c_698', 'c_678']   # c_698=Казань, c_678=Москва (ID из URL Хабра)
-HABR_REMOTE = True                     # remote=true
 HABR_MAX_PAGES = 5                     # сколько страниц на запрос листать
 
 # --- Телеграм: каналы. Добавить источник = дописать строку. ---
@@ -94,7 +96,9 @@ PRODUCT_KEYWORDS = [
     'менеджер продукта', 'менеджер по продукту', 'владелец продукта',
     'delivery manager', 'growth product', 'project manager', 'проджект',
 ]
-_PRODUCT_RE = re.compile('|'.join(re.escape(k) for k in PRODUCT_KEYWORDS), re.I)
+# Допускаем дефис/тире между словами фразы ('Project - Manager' тоже матчится).
+_PRODUCT_RE = re.compile('|'.join(
+    r'[\s\-]+'.join(re.escape(p) for p in k.split(' ')) for k in PRODUCT_KEYWORDS), re.I)
 
 def is_product(*texts):
     return bool(_PRODUCT_RE.search(' '.join(t for t in texts if t)))
@@ -193,10 +197,7 @@ def feed_habr():
     for q in HABR_QUERIES:
         for page in range(1, HABR_MAX_PAGES + 1):
             params = {'q': q, 'type': 'all', 'page': page}
-            loc_qs = ''.join(f'&locations[]={l}' for l in HABR_LOCATIONS)
-            if HABR_REMOTE:
-                loc_qs += '&remote=true'
-            url = f'{base}?{requests.compat.urlencode(params)}{loc_qs}'
+            url = f'{base}?{requests.compat.urlencode(params)}'
             try:
                 r = requests.get(url, headers=HEADERS, timeout=30)
                 time.sleep(SLEEP)
