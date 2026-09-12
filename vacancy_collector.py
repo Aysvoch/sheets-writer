@@ -30,6 +30,8 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+from collection_monitor import check_collection_anomaly
+
 SOURCE_MAX_AGE_DAYS = 12   # сырьё старше стольки дней удаляем из листов-сборщиков
 
 try:
@@ -191,8 +193,11 @@ def _habr_card_to_raw(card):
     )
 
 def feed_habr():
-    """Фидер Хабра: все запросы x страницы, дедуп по source_id внутри фидера."""
+    """Фидер Хабра: все запросы x страницы, дедуп по source_id внутри фидера.
+    Возвращает (список прошедших предфильтр, число карточек ДО предфильтра -
+    для детектора аномалий сбора, см. collection_monitor.py)."""
     found = {}
+    seen_cards = set()   # все распарсенные карточки, независимо от is_product
     base = 'https://career.habr.com/vacancies'
     for q in HABR_QUERIES:
         for page in range(1, HABR_MAX_PAGES + 1):
@@ -209,12 +214,15 @@ def feed_habr():
                     break
                 for c in cards:
                     rv = _habr_card_to_raw(c)
-                    if rv and is_product(rv.title):   # cut: только продуктовое
+                    if not rv:
+                        continue
+                    seen_cards.add(rv.source_id)
+                    if is_product(rv.title):   # cut: только продуктовое
                         found[rv.source_id] = rv
             except Exception as e:
                 print(f'  [Хабр] ошибка на "{q}" стр.{page}: {e}')
                 break
-    return list(found.values())
+    return list(found.values()), len(seen_cards)
 
 # ==========================================================================
 # ФИДЕР: ТЕЛЕГРАМ  (t.me/s/<channel>, сырой текст поста)
@@ -229,16 +237,17 @@ def _tg_page(channel, before=None):
 
 def feed_telegram_channel(channel):
     """
-    Возвращает (список RawVacancy, статус_доступности).
+    Возвращает (список RawVacancy, статус_доступности, число постов ДО
+    предфильтра - для детектора аномалий сбора, см. collection_monitor.py).
     статус: 'ok' | 'empty' | 'unavailable' (чат/приват/опечатка).
     """
     out, seen = [], set()
     try:
         r = _tg_page(channel)
     except Exception as e:
-        return [], f'unavailable ({e})'
+        return [], f'unavailable ({e})', 0
     if r.status_code != 200 or '/s/' not in r.url:
-        return [], 'unavailable (не публичный канал/чат/опечатка)'
+        return [], 'unavailable (не публичный канал/чат/опечатка)', 0
 
     pages = TG_DEEP_PAGES if (DEEP_FIRST_RUN and not TG_SHALLOW_ONLY) else 1
     before = None
@@ -278,17 +287,21 @@ def feed_telegram_channel(channel):
         if TG_SHALLOW_ONLY or not DEEP_FIRST_RUN or not min_id:
             break
         before = min_id     # листаем ленту дальше в прошлое
-    return out, 'ok'
+    return out, 'ok', len(seen)
 
 def feed_telegram():
-    """Фидер телеграма: все каналы. Битые каналы помечает, не падает."""
+    """Фидер телеграма: все каналы. Битые каналы помечает, не падает.
+    Возвращает (список прошедших предфильтр, отчёт по каналам, суммарное
+    число постов ДО предфильтра по всем каналам - для детектора аномалий)."""
     all_v, report = [], []
+    total_raw = 0
     for ch in TG_CHANNELS:
-        vacs, status = feed_telegram_channel(ch)
+        vacs, status, raw_count = feed_telegram_channel(ch)
         report.append((ch, status, len(vacs)))
         all_v.extend(vacs)
+        total_raw += raw_count
         print(f'  [TG] {ch:26} {status:40} постов: {len(vacs)}')
-    return all_v, report
+    return all_v, report, total_raw
 
 # ==========================================================================
 # РЕЕСТР ИСТОЧНИКОВ  <-- сюда добавлять новые фидеры
@@ -431,25 +444,29 @@ def main():
         CREDENTIALS_FILE, scopes=['https://www.googleapis.com/auth/spreadsheets'])
     gc = gspread.authorize(creds)
 
+    collected_counts = {}   # источник -> карточек ДО предфильтра (детектор аномалий)
+
     # --- структурные источники (Хабр и будущие) ---
     for sheet_name, feeder in STRUCTURED_SOURCES:
         print(f'Источник [{sheet_name}]...')
-        vacs = feeder()
+        vacs, total_cards = feeder()
+        collected_counts[sheet_name] = total_cards
         ws = open_ws(gc, sheet_name, COLS_HABR)
         have = existing_ids(ws)
         new = [row_habr(v) for v in vacs if v.source_id not in have]
         n = append_new(ws, new)
-        print(f'  собрано: {len(vacs)}, новых записано: {n}')
+        print(f'  собрано: {len(vacs)} (карточек до предфильтра: {total_cards}), новых записано: {n}')
         cleanup_source(ws, COLS_HABR)
 
     # --- телеграм ---
     print('Источник [Телеграм]...')
-    tg_vacs, report = feed_telegram()
+    tg_vacs, report, total_tg_posts = feed_telegram()
+    collected_counts[SHEET_TG] = total_tg_posts
     ws_tg = open_ws(gc, SHEET_TG, COLS_TG)
     have = existing_ids(ws_tg)
     new_tg = [row_tg(v) for v in tg_vacs if v.source_id not in have]
     n_tg = append_new(ws_tg, new_tg)
-    print(f'  телеграм всего постов: {len(tg_vacs)}, новых записано: {n_tg}')
+    print(f'  телеграм всего постов: {len(tg_vacs)} (постов до предфильтра: {total_tg_posts}), новых записано: {n_tg}')
     cleanup_source(ws_tg, COLS_TG)
 
     bad = [f'{ch} ({st})' for ch, st, _ in report if st != 'ok']
@@ -458,8 +475,23 @@ def main():
         for b in bad:
             print('   -', b)
 
+    try:
+        check_collection_anomaly(gc, collected_counts, open_ws)
+    except Exception as e:
+        print(f'  [мониторинг] детектор аномалий сбора не выполнился: {e}')
+
     print(f'\nЗвено 1 готово. Прогон: {dt.date.today().isoformat()}')
     print('LLM-оценка (звено 2) заполнит колонки llm_оценка/llm_вердикт.')
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            from alerts import report_crash
+            report_crash('vacancy_collector.py', e)
+        raise
+    except Exception as e:
+        from alerts import report_crash
+        report_crash('vacancy_collector.py', e)
+        raise

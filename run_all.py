@@ -59,4 +59,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        from alerts import report_crash
+        report_crash('run_all.py', e)
+        raise

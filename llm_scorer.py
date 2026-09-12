@@ -190,7 +190,15 @@ V_FORMAT = ['Офис', 'Удалёнка', 'Гибрид', 'не указано
 # чтобы не сбивать чтение данных и дедуп по колонке A.
 COLUMNS = ['source_id', 'Компания', 'Должность', 'Опыт (треб.)', 'Грейд',
            'Источник', 'Формат', 'ЗП вилка', 'Локация', 'Оценка',
-           'Вердикт', 'Опубликовано', 'Ссылка', 'Комментарий', 'Просмотрено']
+           'Вердикт', 'Опубликовано', 'Ссылка', 'Комментарий', 'Просмотрено',
+           'Версия промпта']
+
+# ==========================================================================
+# ВЕРСИЯ ПРОМПТА - увеличивай (v2, v3...) при каждой значимой правке
+# SYSTEM_PROMPT, чтобы строки в листе "Вакансии" можно было отличить по
+# версии оценки (см. колонку "Версия промпта" в COLUMNS).
+# ==========================================================================
+PROMPT_VERSION = 'v1'
 
 # ==========================================================================
 # ПРОФИЛЬ КАНДИДАТА для промпта (правь под себя)
@@ -225,7 +233,14 @@ SYSTEM_PROMPT = f"""Ты - строгий ассистент по подбору
   "verdict": "1 сухое предложение на русском языке почему такая оценка, максимум 25 слов"
 }}
 Оценку занижай для Senior/Lead, требований 5+ лет, нерелевантных доменов;
-повышай для junior/intern/стажировок в продукте в России или с удалёнкой. Занижай за локацию только вне РФ без удалёнки."""
+повышай для junior/intern/стажировок в продукте в России или с удалёнкой. Занижай за локацию только вне РФ без удалёнки.
+Если роль по сути НЕ продуктовая (Project/Delivery/Account/Проектный/Аккаунт-менеджер
+и т.п.), даже если рядом встречается слово "продукт" - ставь оценку не выше 3.
+Побочные плюсы (крупная компания, удалёнка, зарплата) НЕ компенсируют несоответствие
+типа роли профилю.
+Если грейд и/или требуемый опыт не указаны в тексте - это НЕ повод для средней оценки:
+неизвестность - недостаток информации, а не находка. Ставь не выше 4 и прямо пиши в
+вердикте, что данных для точной оценки не хватает."""
 
 # JSON-схема ответа. OpenRouter направит запрос провайдеру, который её держит
 # (см. provider=require_parameters в теле). Грейд/Формат/Опыт заданы enum'ом строго
@@ -560,6 +575,7 @@ def build_row(item, data):
         exp, grade, item['src'], fmt, g('salary'), g('location'),
         g('score', ''), verdict,
         item['published'], item['url'], '', '',
+        PROMPT_VERSION,
     ]
 
 def col_to_letter(idx):
@@ -604,8 +620,9 @@ def style_sheet(ws, n_rows):
         pass
     # ширины колонок под содержимое (через batch-запрос к Sheets API)
     # source_id, Компания, Должность, Опыт, Грейд, Источник, Формат, ЗП вилка,
-    # Локация, Оценка, Вердикт, Опубликовано, Ссылка, Комментарий, Просмотрено
-    widths = [80, 170, 170, 80, 80, 110, 90, 130, 150, 80, 320, 100, 100, 300, 90]
+    # Локация, Оценка, Вердикт, Опубликовано, Ссылка, Комментарий, Просмотрено,
+    # Версия промпта
+    widths = [80, 170, 170, 80, 80, 110, 90, 130, 150, 80, 320, 100, 100, 300, 90, 70]
     reqs = []
     sid = ws.id
     for i, w in enumerate(widths):
@@ -721,12 +738,23 @@ def style_sheet(ws, n_rows):
         except Exception as e:
             print(f'  [оформление] часть стилей не применилась: {e}')
 
-def cleanup_old_rows(ws):
+def cleanup_old_rows(ws, delivered_ids=frozenset()):
     """Разгрузка листа: удаляет строки старше MAX_AGE_DAYS (по 'Опубликовано'),
-    затем страховочный cap - если данных всё ещё > MAX_ROWS, обрезает лишние
-    снизу (после сортировки непросмотренные-сверху/оценка-убыв, режутся низкие
-    непросмотренные и все просмотренные). Нераспознанная дата -> НЕ удаляем.
-    Источники сырья (Хабр/Телеграм) не трогаем - дедуп остаётся по source_id."""
+    затем страховочный cap - если данных всё ещё > MAX_ROWS, обрезает лишние.
+    Нераспознанная дата -> НЕ удаляем. Источники сырья (Хабр/Телеграм) не
+    трогаем - дедуп остаётся по source_id.
+
+    delivered_ids - source_id, УЖЕ подтверждённые журналом «Аудитория» (см.
+    возврат notify_audience() и её вызов в main()). Строка защищена от cap'а,
+    если её оценка >= NOTIFY_DETAIL_SCORE и её source_id ещё НЕ в delivered_ids -
+    то есть она ещё может дойти до подписчиков. Раньше cap резал строго по
+    позиции после сортировки (непросмотренные-сверху/оценка-убыв), не зная про
+    доставку - свежую, ещё не отправленную вакансию с оценкой ровно на пороге
+    можно было срезать раньше, чем до неё дойдёт очередь в notify_audience
+    (у неё свой лимит AUDIENCE_BATCH_CAP на прогон). Если защищённых строк
+    больше, чем нужно удалить, чтобы дойти до MAX_ROWS, - cap в этот прогон
+    не дотянется до предела, и это осознанно: лучше временно больше строк,
+    чем потерянная доставка."""
     vals = with_retry(lambda: ws.get_all_values(), what="чтение листа перед подчисткой")
     if len(vals) <= 1:
         return
@@ -748,25 +776,45 @@ def cleanup_old_rows(ws):
     vals = with_retry(lambda: ws.get_all_values(), what="чтение листа после подчистки старья")
     n_data = len(vals) - 1
     if n_data > MAX_ROWS:
+        sid_idx = COLUMNS.index('source_id')
         seen_idx = COLUMNS.index('Просмотрено')
         score_idx = COLUMNS.index('Оценка')
-        reqs = [
-            {'sortRange': {
-                'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': 1 + n_data,
-                          'startColumnIndex': 0, 'endColumnIndex': len(COLUMNS)},
-                'sortSpecs': [
-                    {'dimensionIndex': seen_idx, 'sortOrder': 'ASCENDING'},
-                    {'dimensionIndex': score_idx, 'sortOrder': 'DESCENDING'},
-                ]}},
-            {'deleteDimension': {
+
+        def parse_score(row):
+            try:
+                return float(row[score_idx]) if len(row) > score_idx and row[score_idx] != '' else None
+            except ValueError:
+                return None
+
+        deletable = []   # (rownum, seen_bool, score_or_neg_inf) - только незащищённые
+        for i, row in enumerate(vals[1:], start=2):
+            sid_val = row[sid_idx] if len(row) > sid_idx else ''
+            score = parse_score(row)
+            protected = score is not None and score >= NOTIFY_DETAIL_SCORE and sid_val not in delivered_ids
+            if not protected:
+                seen = row[seen_idx] if len(row) > seen_idx else ''
+                deletable.append((i, seen == 'TRUE', score if score is not None else -1))
+
+        protected_count = n_data - len(deletable)
+        excess = n_data - MAX_ROWS
+        # худшие сначала: просмотренные впереди непросмотренных, внутри - оценка по возрастанию
+        deletable.sort(key=lambda t: (not t[1], t[2]))
+        to_cap = [rownum for rownum, _, _ in deletable[:excess]]
+
+        if to_cap:
+            reqs = [{'deleteDimension': {
                 'range': {'sheetId': sid, 'dimension': 'ROWS',
-                          'startIndex': 1 + MAX_ROWS, 'endIndex': 1 + n_data}}},
-        ]
-        try:
-            ws.spreadsheet.batch_update({'requests': reqs})
-            print(f'  [подчистка] cap {MAX_ROWS}: удалено лишних строк: {n_data - MAX_ROWS}')
-        except Exception as e:
-            print(f'  [подчистка] cap не применился: {e}')
+                          'startIndex': rownum - 1, 'endIndex': rownum}}}
+                    for rownum in sorted(to_cap, reverse=True)]
+            try:
+                ws.spreadsheet.batch_update({'requests': reqs})
+                note = f' (защищено от cap: {protected_count})' if protected_count else ''
+                print(f'  [подчистка] cap {MAX_ROWS}: удалено лишних строк: {len(to_cap)}{note}')
+            except Exception as e:
+                print(f'  [подчистка] cap не применился: {e}')
+        else:
+            print(f'  [подчистка] cap {MAX_ROWS}: строк {n_data}, но все {protected_count} '
+                  f'защищены (ещё не доставлены) - не режу')
 
 # ==========================================================================
 # Телеграм-счётчик
@@ -960,21 +1008,26 @@ def send_audience_message(chat_id, text):
 def notify_audience(gc, ss_raw, ws_vacancies):
     """Рассылка той же ленты подписчикам бота. Падение здесь НЕ должно ронять
     остальной пайплайн (лист уже записан, Андрею уже отправлено) - поэтому вся
-    функция под одним try в вызывающем коде, а не только отдельные отправки."""
+    функция под одним try в вызывающем коде, а не только отдельные отправки.
+
+    Возвращает актуальный набор source_id, УЖЕ подтверждённых журналом
+    «Аудитория» (включая только что отправленные в этом прогоне) - его
+    переиспользует cleanup_old_rows(), чтобы не открывать таблицу-сборщик
+    второй раз ради того же журнала (см. её вызов в main())."""
     if not SUBSCRIBERS_API_SECRET:
-        return   # часть Б не настроена (секрет ещё не залит) - тихо пропускаем
+        return set()   # часть Б не настроена (секрет ещё не залит) - тихо пропускаем
 
     ws_log = open_audience_log(ss_raw)
     cleanup_audience_log(ws_log)
     sent_ids = already_sent_ids(ws_log)
     candidates = build_audience_candidates(ws_vacancies, sent_ids)[:AUDIENCE_BATCH_CAP]
     if not candidates:
-        return
+        return sent_ids
 
     subscribers = fetch_active_subscribers()
     if subscribers is None:
         print('  [аудитория] откладываю рассылку - список подписчиков недоступен')
-        return
+        return sent_ids
 
     messages = build_audience_messages(candidates)
     blocked, sent_count = [], 0
@@ -1005,9 +1058,12 @@ def notify_audience(gc, ss_raw, ws_vacancies):
         print('  [аудитория] ни один получатель не подтверждён - не помечаю как отправленное, повтор в следующий прогон')
     else:
         append_sent(ws_log, [c['source_id'] for c in candidates])
+        sent_ids = sent_ids | {c['source_id'] for c in candidates}
 
     if blocked:
         report_blocked_subscribers(blocked)
+
+    return sent_ids
 
 # ==========================================================================
 # MAIN
@@ -1101,15 +1157,26 @@ def main():
 
     notify_top.sort(key=lambda v: v['score'], reverse=True)
     notify_count(added, notify_top[:10])
+    delivered_ids = set()
     try:
-        notify_audience(gc, ss_raw, ws)
+        delivered_ids = notify_audience(gc, ss_raw, ws) or set()
     except Exception as e:
         print(f'  [аудитория] рассылка не выполнена: {e}')
-    cleanup_old_rows(ws)
+    cleanup_old_rows(ws, delivered_ids)
     total_rows = len(with_retry(lambda: ws.get_all_values(), what="чтение листа перед оформлением"))
     style_sheet(ws, total_rows)
     print(f'\nЗвено 2 готово. Оценено и записано: {added}. Прогон: {dt.date.today().isoformat()}')
     print(f'Модель: {LLM_MODEL}')
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            from alerts import report_crash
+            report_crash('llm_scorer.py', e)
+        raise
+    except Exception as e:
+        from alerts import report_crash
+        report_crash('llm_scorer.py', e)
+        raise
